@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0">
+<title>Habit Tracker</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',sans-serif;background:#F2F3F7;-webkit-font-smoothing:antialiased;}
+#app{max-width:520px;margin:0 auto;min-height:100vh;padding-bottom:80px;}
+
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:18px 18px 10px;background:#F2F3F7;}
+.topbar-title{font-size:22px;font-weight:700;color:#1C1C1E;}
+.btn-ghost{background:none;border:none;cursor:pointer;font-size:13px;color:#999;padding:6px 10px;border-radius:10px;border:1px solid #E0E0E0;background:#fff;}
+
+.month-nav{display:flex;align-items:center;justify-content:center;gap:12px;padding:0 18px 16px;}
+.mnav{width:32px;height:32px;border-radius:50%;background:#fff;border:1px solid #E8E8E8;cursor:pointer;display:flex;align-items:center;justify-content:center;color:#999;}
+.mnav:hover{background:#F0F0F0;}
+.mlabel{font-size:16px;font-weight:600;color:#1C1C1E;min-width:150px;text-align:center;}
+
+.hlist{display:flex;flex-direction:column;gap:14px;padding:0 14px;}
+
+/* CARD */
+.hcard{border-radius:20px;padding:16px 16px 14px;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.06);}
+
+/* TOP ROW */
+.card-top{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:14px;}
+.card-left{}
+.hname{font-size:17px;font-weight:700;margin-bottom:4px;}
+.hcount-row{display:flex;align-items:baseline;gap:5px;}
+.hcount-num{font-size:30px;font-weight:700;line-height:1;}
+.hcount-lbl{font-size:13px;opacity:.6;}
+.streak-badge{display:inline-flex;align-items:center;gap:3px;font-size:11px;font-weight:600;padding:3px 8px;border-radius:20px;margin-top:5px;}
+
+/* MONTHLY GRID */
+.mgrid{display:grid;grid-template-columns:repeat(7,1fr);gap:3px;width:130px;flex-shrink:0;}
+.dsq{width:100%;aspect-ratio:1;border-radius:3px;cursor:pointer;transition:transform .12s;}
+.dsq:active{transform:scale(.68);}
+
+/* DIVIDER */
+.card-divider{border:none;border-top:1px solid #F0F0F0;margin:12px 0 10px;}
+
+/* YEAR SPARKLINE */
+.year-section{}
+.year-label{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:#BBB;margin-bottom:7px;}
+.sparkline{display:flex;align-items:flex-end;gap:3px;height:56px;}
+.sp-col{flex:1;display:flex;flex-direction:column;align-items:center;gap:2px;cursor:pointer;}
+.sp-bar{width:100%;border-radius:3px 3px 0 0;min-height:3px;transition:opacity .15s;}
+.sp-bar:hover{opacity:.75;}
+.sp-lbl{font-size:8px;color:#CCC;margin-top:1px;white-space:nowrap;}
+.sp-cur{font-size:8px;font-weight:700;margin-top:1px;}
+
+/* ADD MODAL */
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.38);z-index:200;display:flex;align-items:flex-end;justify-content:center;opacity:0;pointer-events:none;transition:opacity .2s;}
+.modal-bg.open{opacity:1;pointer-events:all;}
+.modal-sheet{background:#fff;border-radius:22px 22px 0 0;padding:22px 20px 44px;width:100%;max-width:520px;transform:translateY(100%);transition:transform .3s cubic-bezier(.4,0,.2,1);}
+.modal-bg.open .modal-sheet{transform:translateY(0);}
+input[type=text]{width:100%;padding:13px 14px;border:1.5px solid #E5E5EA;border-radius:12px;font-size:15px;outline:none;font-family:inherit;color:#1C1C1E;background:#FAFAFA;}
+input[type=text]:focus{border-color:#2B9FE0;background:#fff;}
+.swatch{width:28px;height:28px;border-radius:50%;cursor:pointer;border:3px solid transparent;transition:transform .1s;}
+.swatch.sel{border-color:#1C1C1E;transform:scale(1.15);}
+
+.fab{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);width:54px;height:54px;border-radius:50%;background:#2B9FE0;color:#fff;border:none;cursor:pointer;font-size:30px;line-height:1;box-shadow:0 4px 18px rgba(43,159,224,.45);z-index:50;}
+.hcard.drag-over{border:2px dashed #2B9FE0!important;background:#EEF7FF;}
+.hcard.dragging{opacity:.4;transform:scale(.98);}
+.drag-handle{cursor:grab;color:#CCC;font-size:18px;padding:4px 8px 4px 0;user-select:none;touch-action:none;line-height:1;flex-shrink:0;}
+.drag-handle:active{cursor:grabbing;}
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="topbar">
+    <div></div>
+    <div style="display:flex;gap:6px;">
+      <button class="btn-ghost" onclick="doImport()">📥</button>
+      <button class="btn-ghost" onclick="doExport()">💾</button>
+      <button class="btn-ghost" onclick="doExportHTML()" title="Exporter en HTML">📄</button>
+      <button class="btn-ghost" onclick="doEdit()">Edit</button>
+    </div>
+  </div>
+  <div class="month-nav">
+    <button class="mnav" onclick="prevM()">
+      <svg width="9" height="14" viewBox="0 0 9 14" fill="none"><path d="M7 1L2 7l5 6" stroke="#999" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+    <span class="mlabel" id="mlbl"></span>
+    <button class="mnav" id="nbtn" onclick="nextM()">
+      <svg width="9" height="14" viewBox="0 0 9 14" fill="none"><path d="M2 1l5 6-5 6" stroke="#999" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+  </div>
+  <div id="pie-wrap" style="padding:0 14px 16px;"></div>
+  <div id="hlist" class="hlist"></div>
+  <div id="hempty" style="display:none;text-align:center;padding:60px 20px;color:#CCC;font-size:14px;">Appuie sur + pour ajouter une habitude.</div>
+</div>
+
+<button class="fab" onclick="openAdd()">+</button>
+
+<div class="modal-bg" id="modal-bg" onclick="modalBgClick(event)">
+  <div class="modal-sheet">
+    <p style="font-size:17px;font-weight:700;margin-bottom:16px;color:#1C1C1E;">Nouvelle habitude</p>
+    <input type="text" id="new-name" placeholder="Ex: Méditer, Lire, Nager…" maxlength="40" style="margin-bottom:16px;">
+    <p style="font-size:11px;color:#BBB;text-transform:uppercase;letter-spacing:.08em;font-weight:600;margin-bottom:9px;">Couleur</p>
+    <div id="swatches" style="display:flex;gap:9px;flex-wrap:wrap;margin-bottom:20px;"></div>
+    <div style="display:flex;gap:10px;">
+      <button onclick="closeAdd()" style="flex:1;padding:14px;border:1.5px solid #E8E8E8;border-radius:13px;background:none;font-size:14px;cursor:pointer;color:#666;font-family:inherit;">Annuler</button>
+      <button onclick="commitAdd()" style="flex:1;padding:14px;border:none;border-radius:13px;background:#2B9FE0;color:#fff;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;">Ajouter</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const PAL=[
+  {n:'coral', bg:'#FFF0EE',f:'#D05050',b:'#F0B0A8',light:'#FFE0DC'},
+  {n:'blue',  bg:'#EEF3FA',f:'#2E68A0',b:'#88B8D8',light:'#D8EAF8'},
+  {n:'teal',  bg:'#E8F8F4',f:'#228888',b:'#68C8C8',light:'#C0EEE8'},
+  {n:'mint',  bg:'#EAF7EF',f:'#1E8858',b:'#68C098',light:'#C0E8D4'},
+  {n:'sky',   bg:'#E8F3FB',f:'#2078B0',b:'#68B8E0',light:'#C0DEED'},
+  {n:'purple',bg:'#F3EEFA',f:'#6048B8',b:'#A888D8',light:'#DDD0F4'},
+  {n:'amber', bg:'#FFF4E6',f:'#A05808',b:'#D89848',light:'#FFE0A8'},
+  {n:'pink',  bg:'#FEF0FA',f:'#C060A0',b:'#E8A8D8',light:'#FAD8F0'},
+];
+const MN=['January','February','March','April','May','June','July','August','September','October','November','December'];
+const MS=['J','F','M','A','M','J','J','A','S','O','N','D'];
+const MSF=['Jan','Fév','Mar','Avr','Mai','Juin','Juil','Aoû','Sep','Oct','Nov','Déc'];
+let H=[],C={},N={},cY,cM,sc2=PAL[0];
+const now=new Date(),tY=now.getFullYear(),tM=now.getMonth(),tD=now.getDate();
+
+const DEFAULT_H=[{"id":"h1","name":"Musculation","color":"coral","sport":true},{"id":"h2","name":"Running","color":"blue","sport":true},{"id":"h1778141203832","name":"Trail","color":"mint","sport":true},{"id":"h1778141226482","name":"Anglais","color":"purple","sport":false},{"id":"h_social","name":"Social Skill","color":"pink","sport":false,"hasNotes":true}];
+const DEFAULT_C={"2024-11-14_h1":1,"2024-11-15_h1":1,"2024-11-17_h1":1,"2024-11-18_h1":1,"2024-11-20_h1":1,"2024-11-21_h1":1,"2024-11-22_h1":1,"2024-11-25_h1":1,"2024-11-28_h1":1,"2024-11-29_h1":1,"2024-12-05_h1":1,"2024-12-07_h1":1,"2024-12-11_h1":1,"2024-12-12_h1":1,"2024-12-13_h1":1,"2024-12-18_h1":1,"2024-12-19_h1":1,"2024-12-22_h1":1,"2024-12-24_h1":1,"2025-01-06_h1":1,"2025-01-07_h1":1,"2025-01-08_h1":1,"2025-01-13_h1":1,"2025-01-15_h1":1,"2025-01-16_h1":1,"2025-01-17_h1":1,"2025-01-21_h1":1,"2025-01-23_h1":1,"2025-01-25_h1":1,"2025-02-01_h1":1,"2025-02-03_h1":1,"2025-02-05_h1":1,"2025-02-07_h1":1,"2025-02-13_h1":1,"2025-02-16_h1":1,"2025-02-19_h1":1,"2025-02-20_h1":1,"2025-02-21_h1":1,"2025-02-27_h1":1,"2025-03-01_h1":1,"2025-03-08_h1":1,"2025-03-09_h1":1,"2025-03-11_h1":1,"2025-03-14_h1":1,"2025-03-16_h1":1,"2025-03-19_h1":1,"2025-03-21_h1":1,"2025-03-22_h1":1,"2025-03-26_h1":1,"2025-03-27_h1":1,"2025-03-29_h1":1,"2025-03-30_h1":1,"2025-04-06_h1":1,"2025-04-17_h1":1,"2025-04-18_h1":1,"2025-04-19_h1":1,"2025-04-21_h1":1,"2025-04-23_h1":1,"2025-04-24_h1":1,"2025-04-27_h1":1,"2025-05-01_h1":1,"2025-05-04_h1":1,"2025-05-08_h1":1,"2025-05-10_h1":1,"2025-05-12_h1":1,"2025-05-13_h1":1,"2025-05-17_h1":1,"2025-05-19_h1":1,"2025-05-20_h1":1,"2025-05-22_h1":1,"2025-05-24_h1":1,"2025-05-27_h1":1,"2025-06-01_h1":1,"2025-06-02_h1":1,"2025-06-05_h1":1,"2025-06-07_h1":1,"2025-06-11_h1":1,"2025-06-15_h1":1,"2025-06-17_h1":1,"2025-06-18_h1":1,"2025-06-20_h1":1,"2025-06-25_h1":1,"2025-07-01_h1":1,"2025-07-04_h1":1,"2025-07-05_h1":1,"2025-07-06_h1":1,"2025-07-10_h1":1,"2025-07-27_h1":1,"2025-08-02_h1":1,"2025-08-05_h1":1,"2025-08-15_h1":1,"2025-08-16_h1":1,"2025-08-22_h1":1,"2025-09-13_h1":1,"2025-09-14_h1":1,"2025-09-16_h1":1,"2025-09-17_h1":1,"2025-09-19_h1":1,"2025-09-20_h1":1,"2025-09-22_h1":1,"2025-09-24_h1":1,"2025-09-26_h1":1,"2025-09-27_h1":1,"2025-09-28_h1":1,"2025-09-29_h1":1,"2025-10-01_h1":1,"2025-10-02_h1":1,"2025-10-04_h1":1,"2025-10-06_h1":1,"2025-10-08_h1":1,"2025-10-11_h1":1,"2025-10-13_h1":1,"2025-10-15_h1":1,"2025-10-17_h1":1,"2025-10-18_h1":1,"2025-10-19_h1":1,"2025-10-22_h1":1,"2025-10-24_h1":1,"2025-10-25_h1":1,"2025-10-26_h1":1,"2025-10-28_h1":1,"2025-10-30_h1":1,"2025-11-06_h1":1,"2025-11-10_h1":1,"2025-11-11_h1":1,"2025-11-14_h1":1,"2025-11-20_h1":1,"2025-11-22_h1":1,"2025-11-24_h1":1,"2025-11-26_h1":1,"2025-11-30_h1":1,"2025-12-23_h1":1,"2025-12-28_h1":1,"2025-12-31_h1":1,"2026-01-03_h1":1,"2026-01-04_h1":1,"2026-01-05_h1":1,"2026-01-08_h1":1,"2026-01-09_h1":1,"2026-01-10_h1":1,"2026-01-14_h1":1,"2026-01-15_h1":1,"2026-01-17_h1":1,"2026-01-22_h1":1,"2026-01-28_h1":1,"2026-01-29_h1":1,"2026-02-02_h1":1,"2026-02-03_h1":1,"2026-02-10_h1":1,"2026-02-13_h1":1,"2026-03-04_h1":1,"2026-03-07_h1":1,"2026-03-14_h1":1,"2026-03-16_h1":1,"2026-03-18_h1":1,"2026-03-22_h1":1,"2026-03-27_h1":1,"2026-04-01_h1":1,"2026-04-02_h1":1,"2026-04-06_h1":1,"2026-04-08_h1":1,"2026-04-11_h1":1,"2026-04-14_h1":1,"2026-04-17_h1":1,"2026-04-21_h1":1,"2026-04-25_h1":1,"2026-04-05_h2":1,"2026-04-29_h1":1,"2026-04-24_h1":1,"2026-04-10_h1":1,"2026-04-19_h1":1,"2026-04-22_h1":1,"2026-04-12_h2":1,"2026-04-18_h2":1,"2026-04-02_h2":1,"2026-04-08_h2":1,"2026-04-27_h2":1,"2026-03-24_h1":1,"2026-03-30_h1":1,"2026-03-23_h1":1,"2026-03-06_h2":1,"2026-03-21_h2":1,"2026-03-29_h2":1,"2026-03-19_h2":1,"2026-03-17_h2":1,"2026-03-24_h2":1,"2026-02-05_h1":1,"2026-02-08_h1":1,"2026-02-07_h1":1,"2026-02-01_h2":1,"2026-02-07_h2":1,"2026-02-05_h2":1,"2026-02-17_h2":1,"2026-01-23_h1":1,"2026-01-24_h1":1,"2026-01-04_h2":1,"2026-01-11_h2":1,"2026-01-24_h2":1,"2026-01-30_h2":1,"2026-01-28_h2":1,"2025-12-21_h2":1,"2025-12-29_h2":1,"2025-12-21_h1":1,"2025-12-27_h1":1,"2025-12-26_h1":1,"2025-12-11_h1":1,"2025-12-02_h1":1,"2025-12-16_h1":1,"2025-11-02_h1":1,"2025-11-03_h1":1,"2025-11-05_h1":1,"2025-11-07_h1":1,"2025-11-15_h1":1,"2025-11-19_h1":1,"2025-11-08_h2":1,"2025-11-04_h2":1,"2025-10-29_h2":1,"2025-10-22_h2":1,"2025-10-16_h2":1,"2025-10-14_h2":1,"2025-10-10_h2":1,"2025-10-05_h2":1,"2025-10-18_h2":1,"2025-09-30_h2":1,"2025-09-24_h2":1,"2025-09-17_h2":1,"2025-09-20_h2":1,"2025-08-06_h1":1,"2025-08-23_h1":1,"2025-08-30_h1":1,"2025-08-31_h1":1,"2025-08-25_h2":1,"2025-08-06_h2":1,"2025-08-14_h2":1,"2025-08-21_h2":1,"2025-08-29_h2":1,"2025-08-17_h2":1,"2025-08-03_h2":1,"2025-07-02_h1":1,"2025-07-17_h1":1,"2025-07-26_h1":1,"2025-07-02_h2":1,"2025-07-09_h2":1,"2025-07-15_h2":1,"2025-07-06_h2":1,"2025-06-22_h1":1,"2025-06-27_h1":1,"2025-06-28_h1":1,"2025-06-16_h1":1,"2025-06-30_h2":1,"2025-06-10_h2":1,"2025-06-21_h2":1,"2025-06-15_h2":1,"2025-05-09_h1":1,"2025-05-19_h2":1,"2025-05-06_h2":1,"2025-05-14_h2":1,"2025-05-22_h2":1,"2025-05-31_h2":1,"2025-05-17_h2":1,"2025-05-10_h2":1,"2025-04-04_h1":1,"2025-04-09_h1":1,"2025-04-08_h1":1,"2025-04-07_h1":1,"2025-04-22_h2":1,"2025-04-26_h2":1,"2025-03-05_h1":1,"2025-03-06_h1":1,"2025-03-25_h1":1,"2025-03-18_h1":1,"2025-03-23_h2":1,"2025-03-30_h2":1,"2025-02-09_h1":1,"2025-02-08_h1":1,"2025-02-28_h1":1,"2025-02-18_h1":1,"2025-02-24_h1":1,"2025-02-06_h2":1,"2025-02-13_h2":1,"2025-02-26_h2":1,"2025-01-02_h1":1,"2025-01-20_h1":1,"2025-01-26_h1":1,"2025-01-30_h1":1,"2025-01-29_h2":1,"2024-12-06_h1":1,"2024-12-08_h1":1,"2024-12-26_h1":1,"2024-12-01_h2":1,"2024-12-09_h2":1,"2024-12-17_h2":1,"2024-12-24_h2":1,"2024-11-03_h2":1,"2024-11-10_h2":1,"2024-11-17_h2":1,"2024-11-24_h2":1,"2024-10-27_h2":1,"2024-10-21_h2":1,"2024-09-06_h2":1,"2024-09-13_h2":1,"2026-05-03_h2":1,"2026-05-05_h1":1};
+
+function load(){
+  try{H=JSON.parse(localStorage.getItem('hbt5_h')||'null');}catch(e){H=null;}
+  try{C=JSON.parse(localStorage.getItem('hbt5_c')||'null');}catch(e){C=null;}
+  try{N=JSON.parse(localStorage.getItem('hbt5_n')||'null')||{};}catch(e){N={};}
+  if(!H){H=DEFAULT_H;C=DEFAULT_C;sv();}
+  if(!C){C=DEFAULT_C;sv();}
+  // Réinjecte les flags depuis DEFAULT_H
+  H=H.map(h=>{
+    const def=DEFAULT_H.find(d=>d.id===h.id);
+    if(!def) return h;
+    const patch={};
+    if(def.sport===false) patch.sport=false;
+    if(def.hasNotes) patch.hasNotes=true;
+    return Object.assign({},h,patch);
+  });
+  // Ajoute Social Skill si absent
+  if(!H.find(h=>h.id==='h_social')) H.push(DEFAULT_H.find(h=>h.id==='h_social'));
+}
+function sv(){localStorage.setItem('hbt5_h',JSON.stringify(H));localStorage.setItem('hbt5_c',JSON.stringify(C));localStorage.setItem('hbt5_n',JSON.stringify(N));}
+function ck(d,id){return d+'_'+id;}
+function dim(y,m){return new Date(y,m+1,0).getDate();}
+function ds(y,m,d){return `${y}-${String(m+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;}
+function gd(y,m,d,id){return!!C[ck(ds(y,m,d),id)];}
+function cm(id,y,m){let n=0;for(let d=1;d<=dim(y,m);d++)if(gd(y,m,d,id))n++;return n;}
+function pc(h){return PAL.find(p=>p.n===h.color)||PAL[0];}
+function streak(id){
+  let s=0,d=new Date(tY,tM,tD);
+  for(let i=0;i<365;i++){
+    const key=ds(d.getFullYear(),d.getMonth(),d.getDate());
+    if(C[ck(key,id)]){s++;d.setDate(d.getDate()-1);}else break;
+  }
+  return s;
+}
+function tog(y,m,d,id){
+  const k=ck(ds(y,m,d),id);C[k]?delete C[k]:(C[k]=1);sv();rl();
+}
+function last12(){
+  const a=[];for(let i=11;i>=0;i--){let m=tM-i,y=tY;while(m<0){m+=12;y--;}a.push({y,m});}return a;
+}
+
+function buildPieSVG(data,total,size,showLabels){
+  if(!data.length) return `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}"><circle cx="${size/2}" cy="${size/2}" r="${size*0.38}" fill="#F0F0F0"/></svg>`;
+  const cx=size/2,cy=size/2,R=size*0.39,holeR=size*0.225;
+  let angle=-Math.PI/2,slices='',labels='';
+  data.forEach(({c,cnt})=>{
+    const slice=2*Math.PI*(cnt/total);
+    const mid=angle+slice/2;
+    const x1=cx+R*Math.cos(angle),y1=cy+R*Math.sin(angle);
+    angle+=slice;
+    const x2=cx+R*Math.cos(angle),y2=cy+R*Math.sin(angle);
+    const xi1=cx+holeR*Math.cos(angle-slice),yi1=cy+holeR*Math.sin(angle-slice);
+    const xi2=cx+holeR*Math.cos(angle),yi2=cy+holeR*Math.sin(angle);
+    const large=slice>Math.PI?1:0;
+    const path=`M${xi1.toFixed(1)},${yi1.toFixed(1)} L${x1.toFixed(1)},${y1.toFixed(1)} A${R},${R} 0 ${large},1 ${x2.toFixed(1)},${y2.toFixed(1)} L${xi2.toFixed(1)},${yi2.toFixed(1)} A${holeR},${holeR} 0 ${large},0 ${xi1.toFixed(1)},${yi1.toFixed(1)} Z`;
+    slices+=`<path d="${path}" fill="${c.f}" opacity="0.9"/>`;
+    if(showLabels&&cnt/total>0.1){
+      const lx=cx+(R+holeR)/2*Math.cos(mid),ly=cy+(R+holeR)/2*Math.sin(mid);
+      labels+=`<text x="${lx.toFixed(1)}" y="${(ly+3).toFixed(1)}" text-anchor="middle" font-size="${size*0.065}" font-weight="700" fill="#fff" font-family="-apple-system,sans-serif">${Math.round(cnt/total*100)}%</text>`;
+    }
+  });
+  return `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">${slices}${labels}</svg>`;
+}
+
+function renderPie(){
+  const sportH=H.filter(h=>h.sport!==false);
+  const data=sportH.map(h=>({h,c:pc(h),cnt:cm(h.id,cY,cM)})).filter(d=>d.cnt>0);
+  const wrap=document.getElementById('pie-wrap');
+  if(!data.length){wrap.innerHTML='';return;}
+  const total=data.reduce((s,d)=>s+d.cnt,0);
+
+  // Year grid (12 months of cY)
+  const monthTotals=Array.from({length:12},(_,m)=>sportH.reduce((s,h)=>s+cm(h.id,cY,m),0));
+  const maxT=Math.max(...monthTotals,1);
+  const minSz=36,maxSz=70;
+  const yearGrid=Array.from({length:12},(_,m)=>{
+    const mData=sportH.map(h=>({h,c:pc(h),cnt:cm(h.id,cY,m)})).filter(d=>d.cnt>0);
+    const mTotal=monthTotals[m];
+    const sz=mTotal>0?Math.round(minSz+(maxSz-minSz)*(mTotal/maxT)):minSz;
+    const isCur=cY===tY&&m===tM;
+    const isSel=m===cM&&!isCur;
+    const svg=buildPieSVG(mData,mTotal,sz,false);
+    return `<div onclick="goMonth(${cY},${m})" style="display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:3px;cursor:pointer;height:${maxSz+28}px;opacity:${mTotal===0?.25:1};">
+      <div style="position:relative;border-radius:50%;padding:2px;box-sizing:border-box;border:2px solid ${isCur?'#2B9FE0':isSel?'#AAA':'transparent'};">
+        ${svg}
+        ${mTotal>0?`<div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;"><span style="font-size:${sz<45?8:10}px;font-weight:800;color:#1C1C1E;background:rgba(255,255,255,0.82);border-radius:20px;padding:1px 4px;line-height:1.3;">${mTotal}</span></div>`:''}
+      </div>
+      <span style="font-size:9px;font-weight:${isCur?700:500};color:${isCur?'#2B9FE0':'#888'};">${MS[m]}</span>
+    </div>`;
+  }).join('');
+
+  wrap.innerHTML=`
+    <div style="display:flex;justify-content:center;padding:4px 0 4px;">
+      <div id="main-pie" onclick="const g=document.getElementById('year-grid-wrap');g.style.display=g.style.display==='none'?'block':'none';" style="cursor:pointer;position:relative;">
+        ${buildPieSVG(data,total,160,true)}
+        <div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;pointer-events:none;">
+          <span style="font-size:20px;font-weight:700;color:#1C1C1E;line-height:1;">${total}</span>
+          <span style="font-size:9px;color:#999;">séances</span>
+        </div>
+      </div>
+    </div>
+    <div id="year-grid-wrap" style="display:none;padding:0 8px 12px;">
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px 6px;padding:10px 4px 4px;">
+        ${yearGrid}
+      </div>
+    </div>`;
+}
+
+
+function rl(){
+  const D=dim(cY,cM),ic=cY===tY&&cM===tM;
+  document.getElementById('mlbl').textContent=MSF[cM]+' '+cY;
+  const nb=document.getElementById('nbtn');
+  const atMax=(tM===11&&cY===tY+1&&cM===0)||(cY===tY&&cM===tM+1);nb.style.opacity=atMax?'.28':'1';nb.style.pointerEvents=atMax?'none':'all';
+  const el=document.getElementById('hlist'),em=document.getElementById('hempty');
+  if(!H.length){el.innerHTML='';em.style.display='block';return;}
+  em.style.display='none';
+  renderPie();
+
+  el.innerHTML=H.map(h=>{
+    const c=pc(h),cnt=cm(h.id,cY,cM),st=streak(h.id);
+
+    // unified calendar grid: day headers + aligned squares
+    const firstDow=(new Date(cY,cM,1).getDay()+6)%7;
+    const DLBLS=['L','M','M','J','V','S','D'];
+    let cells=DLBLS.map(d=>`<div style="text-align:center;font-size:8px;font-weight:600;color:${c.b};padding-bottom:2px;">${d}</div>`).join('');
+    for(let i=0;i<firstDow;i++) cells+=`<div class="dsq" style="pointer-events:none;background:transparent;"></div>`;
+    for(let day=1;day<=D;day++){
+      const f=gd(cY,cM,day,h.id),fut=(ic&&day>tD)||(cY===tY&&cM>tM)||(cY>tY),isT=ic&&day===tD;
+      const dateStr=ds(cY,cM,day);
+      const nk=dateStr+'_'+h.id;
+      const hasNote=h.hasNotes&&N[nk];
+      const noteDot=hasNote?`<div style="position:absolute;bottom:2px;left:50%;transform:translateX(-50%);width:4px;height:4px;border-radius:50%;background:${f?'rgba(255,255,255,0.9)':c.f};"></div>`:'';
+      const lbl=isT?`<span style="font-size:8px;font-weight:700;line-height:1;color:${f?'#fff':c.f};">${day}</span>`:'';
+      const noteAttr=h.hasNotes&&!fut?` data-note-day="${day}" data-note-hid="${h.id}"`:'' ;
+      const style_done=`position:relative;background:${c.f};display:flex;align-items:center;justify-content:center;`;
+      const style_empty=`position:relative;border:${isT?`2px solid ${c.f}`:`1.5px solid ${c.b}`};display:flex;align-items:center;justify-content:center;`;
+      if(fut) cells+=`<div class="dsq" style="border:1.5px solid ${c.b};opacity:.25;pointer-events:none;"></div>`;
+      else if(h.hasNotes) cells+=`<div class="dsq nsq" style="${f?style_done:style_empty}"${noteAttr} onclick="tog(${cY},${cM},${day},'${h.id}');openNoteModal('${dateStr}','${h.id}')">${lbl}</div>`;
+      else if(f) cells+=`<div class="dsq" style="${style_done}" onclick="tog(${cY},${cM},${day},'${h.id}')">${lbl}</div>`;
+      else cells+=`<div class="dsq" style="${style_empty}" onclick="tog(${cY},${cM},${day},'${h.id}')">${lbl}</div>`;
+    }
+    let sq=cells;
+
+    // 12-month sparkline
+    // Yearly totals
+    const cyTotal=(()=>{let n=0;for(let m=0;m<12;m++)n+=cm(h.id,tY,m);return n;})();
+    const pyTotal=(()=>{let n=0;for(let m=0;m<12;m++)n+=cm(h.id,tY-1,m);return n;})();
+    const diff=cyTotal-pyTotal;
+    const dSign=diff>0?'+':'';
+    const dCol=diff>0?'#34C759':diff<0?'#FF3B30':'#999';
+    const allYears=(()=>{
+      const rows=[];
+      for(let y=tY-2;y>=tY-5;y--){
+        const tot=(()=>{let n=0;for(let m=0;m<12;m++)n+=cm(h.id,y,m);return n;})();
+        if(tot>0)rows.push(`<span style="color:${c.b};font-size:11px;">${y} <strong style="color:${c.f}">${tot}</strong></span>`);
+      }
+      return rows.join('<span style="color:'+c.b+'44;margin:0 4px;">·</span>');
+    })();
+    const uid='yc_'+h.id;
+    const yearlyComp=`<div style="margin-top:7px;padding-top:6px;border-top:1px solid ${c.b}22;">
+      <div onclick="const el=document.getElementById('${uid}');el.style.display=el.style.display==='flex'?'none':'flex'" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+        <span style="font-size:11px;color:${c.b};">${tY-1} <strong style="color:${c.b};font-size:13px;">${pyTotal}</strong></span>
+        <span style="font-size:10px;color:${c.b}44;">→</span>
+        <span style="font-size:11px;color:${c.b};"><strong style="color:${c.f};">${tY}</strong> <span style="color:${c.f};font-size:13px;">${cyTotal}</span></span>
+        <span style="font-size:9px;color:${c.b}44;margin-left:auto;">▾</span>
+      </div>
+      <div id="${uid}" style="display:none;margin-top:5px;flex-wrap:wrap;gap:6px;">${allYears}</div>
+    </div>`;
+    const m12=last12();
+    const counts=m12.map(({y,m})=>cm(h.id,y,m));
+    const mx=Math.max(...counts,1);
+    const avg=counts.filter(v=>v>0).reduce((a,b)=>a+b,0)/Math.max(counts.filter(v=>v>0).length,1);
+    const avgPx=Math.round(avg/mx*36);
+    const spark='<div style="position:relative;display:flex;align-items:flex-end;gap:3px;height:56px;width:100%;">'
+      +m12.map(({y,m},i)=>{
+        const px=Math.max(Math.round(counts[i]/mx*36),counts[i]>0?4:0);
+        const isCur=y===tY&&m===tM;
+        const isSelected=y===cY&&m===cM&&!isCur;
+        return `<div class="sp-col" onclick="goMonth(${y},${m})">
+        <span style="font-size:8px;font-weight:700;color:${counts[i]>0?(isCur?c.f:c.b):'transparent'};height:10px;line-height:10px;">${counts[i]||''}</span>
+        <div class="sp-bar" style="height:${px}px;background:${isCur?c.f:isSelected?c.f+'BB':c.b};${isCur?'box-shadow:0 0 0 1.5px '+c.f+'44;':''}"></div>
+        <span class="${isCur?'sp-cur':'sp-lbl'}" style="${isCur?'color:'+c.f+';':''}">${MS[m]}</span>
+      </div>`;
+      }).join('')
+      +`<div style="position:absolute;bottom:${avgPx+13}px;left:0;right:0;border-top:1.5px dashed ${c.f}88;pointer-events:none;"></div>`
+      +'</div>';
+
+    const streakBadge=st>=2?`<div class="streak-badge" style="background:${c.light};color:${c.f};">🔥 ${st} jours</div>`:'';
+
+    return `<div class="hcard" data-id="${h.id}" style="border-top:3px solid ${c.f};">
+      <div class="card-top">
+        <div class="drag-handle" title="Maintenir pour déplacer">⠿</div>
+        <div class="card-left">
+          <p class="hname" style="color:${c.f};">${h.name}</p>
+          <div class="hcount-row">
+            <span class="hcount-num" style="color:${c.f};">${cnt}</span>
+            <span class="hcount-lbl" style="color:${c.f};">fois ce mois</span>
+          </div>
+          ${streakBadge}
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:3px;width:154px;flex-shrink:0;" onclick="event.stopPropagation()">${sq}</div>
+      </div>
+      <hr class="card-divider">
+      <div class="year-section">
+        <p class="year-label">12 derniers mois</p>
+        ${spark}
+          ${yearlyComp}
+      </div>
+    </div>`;
+  }).join('');
+  initDrag();
+}
+
+function goMonth(y,m){cY=y;cM=m;rl();}
+
+function initNotes(){
+  document.querySelectorAll('.nsq[data-note-day]').forEach(sq=>{
+    let timer=null, triggered=false;
+    const day=parseInt(sq.dataset.noteDay);
+    const hid=sq.dataset.noteHid;
+
+    const startPress=()=>{ triggered=false; timer=setTimeout(()=>{ triggered=true; if(navigator.vibrate)navigator.vibrate(40); openNoteModal(ds(cY,cM,day),hid); },450); };
+    const endPress=()=>{ clearTimeout(timer); };
+    const doClick=()=>{ if(!triggered) tog(cY,cM,day,hid); };
+
+    sq.addEventListener('mousedown', startPress);
+    sq.addEventListener('mouseup', endPress);
+    sq.addEventListener('click', doClick);
+    sq.addEventListener('touchstart', startPress, {passive:true});
+    sq.addEventListener('touchend', e=>{ endPress(); if(!triggered){ e.preventDefault(); tog(cY,cM,day,hid); } }, {passive:false});
+    sq.addEventListener('touchmove', ()=>{ clearTimeout(timer); triggered=true; }, {passive:true});
+  });
+}
+
+function openNoteModal(dateStr,hid){
+  const h=H.find(x=>x.id===hid);
+  const c=pc(h);
+  const nk=dateStr+'_'+hid;
+  const existing=N[nk]||'';
+  const [yr,mo,dy]=dateStr.split('-');
+  const label=`${parseInt(dy)} ${MSF[parseInt(mo)-1]} ${yr}`;
+  const ov=document.createElement('div');
+  ov.id='note-modal';
+  ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:1000;display:flex;align-items:flex-end;justify-content:center;padding:0 0 20px;';
+  ov.innerHTML=`<div style="background:#fff;border-radius:24px 24px 20px 20px;padding:20px;width:100%;max-width:520px;display:flex;flex-direction:column;gap:12px;">
+    <div style="display:flex;align-items:center;justify-content:space-between;">
+      <div>
+        <p style="font-size:13px;font-weight:700;color:${c.f};">✦ Social Skill</p>
+        <p style="font-size:12px;color:#999;margin-top:1px;">${label}</p>
+      </div>
+      <button onclick="document.getElementById('note-modal').remove()" style="background:none;border:none;font-size:24px;color:#BBB;cursor:pointer;line-height:1;">×</button>
+    </div>
+    <textarea id="note-ta" placeholder="Décris l'action réalisée…" style="height:130px;padding:12px;border:1.5px solid ${c.light};border-radius:14px;font-size:14px;font-family:-apple-system,sans-serif;resize:none;outline:none;color:#333;background:#FAFAFA;line-height:1.5;">${existing}</textarea>
+    <div style="display:flex;gap:10px;">
+      ${existing?`<button onclick="const nk='${dateStr}_${hid}';delete N[nk];sv();document.getElementById('note-modal').remove();rl();" style="padding:13px 16px;border:none;border-radius:13px;background:#FFE0E0;color:#D04040;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;">Supprimer</button>`:''}
+      <button onclick="const v=document.getElementById('note-ta').value.trim();if(v){N['${nk}']=v;sv();}else{delete N['${nk}'];sv();}document.getElementById('note-modal').remove();rl();" style="flex:1;padding:13px;border:none;border-radius:13px;background:${c.f};color:#fff;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;">Enregistrer</button>
+    </div>
+  </div>`;
+  document.body.appendChild(ov);
+  ov.addEventListener('click',e=>{if(e.target===ov)ov.remove();});
+  setTimeout(()=>document.getElementById('note-ta').focus(),100);
+}
+
+// ── Drag & drop ──────────────────────────────────────────────────
+let dragSrcId=null;
+
+function initDrag(){
+  const list=document.getElementById('hlist');
+  const cards=[...list.querySelectorAll('.hcard')];
+
+  cards.forEach(card=>{
+    const handle=card.querySelector('.drag-handle');
+
+    // ── Mouse drag ──
+    handle.addEventListener('mousedown',e=>{
+      card.setAttribute('draggable','true');
+    });
+    card.addEventListener('dragstart',e=>{
+      dragSrcId=card.dataset.id;
+      setTimeout(()=>card.classList.add('dragging'),0);
+      e.dataTransfer.effectAllowed='move';
+    });
+    card.addEventListener('dragend',()=>{
+      card.classList.remove('dragging');
+      card.removeAttribute('draggable');
+      list.querySelectorAll('.hcard').forEach(c=>c.classList.remove('drag-over'));
+    });
+    card.addEventListener('dragover',e=>{
+      e.preventDefault();
+      list.querySelectorAll('.hcard').forEach(c=>c.classList.remove('drag-over'));
+      if(card.dataset.id!==dragSrcId) card.classList.add('drag-over');
+    });
+    card.addEventListener('drop',e=>{
+      e.preventDefault();
+      card.classList.remove('drag-over');
+      if(!dragSrcId||dragSrcId===card.dataset.id) return;
+      const fromIdx=H.findIndex(h=>h.id===dragSrcId);
+      const toIdx=H.findIndex(h=>h.id===card.dataset.id);
+      if(fromIdx<0||toIdx<0) return;
+      const [moved]=H.splice(fromIdx,1);
+      H.splice(toIdx,0,moved);
+      sv(); rl();
+    });
+
+    // ── Touch drag (long press) ──
+    let pressTimer=null, touchClone=null, active=false;
+
+    handle.addEventListener('touchstart',e=>{
+      const touch=e.touches[0];
+      pressTimer=setTimeout(()=>{
+        active=true;
+        dragSrcId=card.dataset.id;
+        card.classList.add('dragging');
+        // clone flottant
+        touchClone=card.cloneNode(true);
+        touchClone.style.cssText=`position:fixed;width:${card.offsetWidth}px;opacity:.85;pointer-events:none;z-index:9999;box-shadow:0 8px 24px rgba(0,0,0,.18);border-radius:20px;top:${card.getBoundingClientRect().top}px;left:${card.getBoundingClientRect().left}px;transition:none;`;
+        document.body.appendChild(touchClone);
+        if(navigator.vibrate) navigator.vibrate(40);
+      },400);
+    },{passive:true});
+
+    handle.addEventListener('touchmove',e=>{
+      clearTimeout(pressTimer);
+      if(!active) return;
+      e.preventDefault();
+      const touch=e.touches[0];
+      touchClone.style.top=(touch.clientY-40)+'px';
+      touchClone.style.left=(touch.clientX-card.offsetWidth/2)+'px';
+      // trouver la cible
+      touchClone.style.display='none';
+      const el=document.elementFromPoint(touch.clientX,touch.clientY);
+      touchClone.style.display='';
+      const target=el&&el.closest('.hcard');
+      list.querySelectorAll('.hcard').forEach(c=>c.classList.remove('drag-over'));
+      if(target&&target.dataset.id!==dragSrcId) target.classList.add('drag-over');
+    },{passive:false});
+
+    const endTouch=e=>{
+      clearTimeout(pressTimer);
+      if(!active){active=false;return;}
+      active=false;
+      if(touchClone){touchClone.remove();touchClone=null;}
+      card.classList.remove('dragging');
+      const over=list.querySelector('.hcard.drag-over');
+      list.querySelectorAll('.hcard').forEach(c=>c.classList.remove('drag-over'));
+      if(over&&dragSrcId&&over.dataset.id!==dragSrcId){
+        const fromIdx=H.findIndex(h=>h.id===dragSrcId);
+        const toIdx=H.findIndex(h=>h.id===over.dataset.id);
+        if(fromIdx>=0&&toIdx>=0){
+          const [moved]=H.splice(fromIdx,1);
+          H.splice(toIdx,0,moved);
+          sv(); rl();
+        }
+      }
+      dragSrcId=null;
+    };
+    handle.addEventListener('touchend',endTouch,{passive:true});
+    handle.addEventListener('touchcancel',endTouch,{passive:true});
+  });
+}
+
+let sc3=PAL[0];
+function openAdd(){sc3=PAL[0];document.getElementById('new-name').value='';rcs();document.getElementById('modal-bg').classList.add('open');setTimeout(()=>document.getElementById('new-name').focus(),200);}
+function closeAdd(){document.getElementById('modal-bg').classList.remove('open');}
+function modalBgClick(e){if(e.target===document.getElementById('modal-bg'))closeAdd();}
+function rcs(){document.getElementById('swatches').innerHTML=PAL.map(c=>`<div class="swatch ${sc3.n===c.n?'sel':''}" style="background:${c.f};" onclick="sc3=PAL.find(p=>p.n==='${c.n}');rcs()"></div>`).join('');}
+function commitAdd(){const name=document.getElementById('new-name').value.trim();if(!name)return;H.push({id:'h'+Date.now(),name,color:sc3.n});sv();closeAdd();rl();}
+
+function doExportHTML(){
+  let src=document.documentElement.outerHTML;
+  const hJson=JSON.stringify(H);
+  const cJson=JSON.stringify(C);
+  // Remplace DEFAULT_H et DEFAULT_C avec les données actuelles
+  src=src.replace(/const DEFAULT_H=\[.*?\];/s,`const DEFAULT_H=${hJson};`);
+  src=src.replace(/const DEFAULT_C=\{.*?\};/s,`const DEFAULT_C=${cJson};`);
+  // Vide le localStorage injecté dans le DOM (repart des defaults proprement)
+  src=src.replace(/<script>const PAL/,'<script>\nlocalStorage.removeItem(\'hbt5_h\');\nlocalStorage.removeItem(\'hbt5_c\');\nconst PAL');
+  const blob=new Blob(['<!DOCTYPE html>\n'+src],{type:'text/html'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download='habit_tracker_'+new Date().toISOString().slice(0,10)+'.html';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function doImport(){
+  const ov=document.createElement('div');
+  ov.id='imp-modal';
+  ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:999;display:flex;align-items:center;justify-content:center;padding:20px;';
+  ov.innerHTML=`<div style="background:#fff;border-radius:16px;padding:20px;width:100%;max-width:440px;display:flex;flex-direction:column;gap:12px;">
+    <div style="display:flex;align-items:center;justify-content:space-between;">
+      <p style="font-size:15px;font-weight:600;color:#1C1C1E;">📥 Importer depuis Notion</p>
+      <button onclick="document.getElementById('imp-modal').remove()" style="background:none;border:none;cursor:pointer;font-size:22px;color:#999;">×</button>
+    </div>
+    <p style="font-size:13px;color:#888;">Colle ton JSON Notion ici pour mettre à jour le tracker.</p>
+    <textarea id="imp-ta" placeholder='{"habits":[...],"completions":{...}}' style="height:200px;padding:10px;border:1.5px solid #E0E0E0;border-radius:10px;font-size:10px;font-family:monospace;resize:none;outline:none;color:#555;background:#F8F8F8;"></textarea>
+    <button onclick="
+      try{
+        const d=JSON.parse(document.getElementById('imp-ta').value);
+        if(!d.habits||!d.completions)throw new Error('Format invalide');
+        H=d.habits;C=d.completions;sv();
+        document.getElementById('imp-modal').remove();
+        rl();
+        const t=document.createElement('div');
+        t.style.cssText='position:fixed;bottom:100px;left:50%;transform:translateX(-50%);background:#34C759;color:#fff;padding:10px 20px;border-radius:20px;font-size:14px;font-weight:600;z-index:9999;';
+        t.textContent='✓ Données importées !';
+        document.body.appendChild(t);
+        setTimeout(()=>t.remove(),2500);
+      }catch(e){alert('JSON invalide : '+e.message);}
+    " style="padding:13px;border:none;border-radius:12px;background:#2B9FE0;color:#fff;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;">Importer</button>
+  </div>`;
+  document.body.appendChild(ov);
+  ov.addEventListener('click',e=>{if(e.target===ov)ov.remove();});
+}
+
+function doExport(){
+  const data={habits:H,completions:C,exportedAt:new Date().toISOString()};
+  const json=JSON.stringify(data,null,2);
+  try{
+    const blob=new Blob([json],{type:'application/json'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url;a.download='habits_backup_'+new Date().toISOString().slice(0,10)+'.json';
+    document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);
+  }catch(e){}
+  const ov=document.createElement('div');
+  ov.id='exp-modal';
+  ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:999;display:flex;align-items:center;justify-content:center;padding:20px;';
+  ov.innerHTML=`<div style="background:#fff;border-radius:16px;padding:20px;width:100%;max-width:440px;display:flex;flex-direction:column;gap:12px;">
+    <div style="display:flex;align-items:center;justify-content:space-between;">
+      <p style="font-size:15px;font-weight:600;color:#1C1C1E;">💾 Sauvegarde</p>
+      <button onclick="document.getElementById('exp-modal').remove()" style="background:none;border:none;cursor:pointer;font-size:22px;color:#999;">×</button>
+    </div>
+    <p style="font-size:13px;color:#888;">Copie et envoie ce texte à Claude pour restaurer.</p>
+    <textarea id="exp-ta" readonly style="height:180px;padding:10px;border:1px solid #E0E0E0;border-radius:10px;font-size:10px;font-family:monospace;resize:none;outline:none;color:#555;background:#F8F8F8;">${json}</textarea>
+    <button onclick="navigator.clipboard.writeText(document.getElementById('exp-ta').value).then(()=>{this.textContent='✓ Copié !';this.style.background='#34C759';}).catch(()=>{document.getElementById('exp-ta').select();document.execCommand('copy');this.textContent='✓ Copié !';this.style.background='#34C759';})" style="padding:13px;border:none;border-radius:12px;background:#2B9FE0;color:#fff;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;">📋 Copier le JSON</button>
+  </div>`;
+  document.body.appendChild(ov);
+  ov.addEventListener('click',e=>{if(e.target===ov)ov.remove();});
+}
+
+function doEdit(){
+  if(!H.length)return;
+  const idx=prompt(H.map((h,i)=>`${i+1}. ${h.name}`).join('\n')+'\n\nNuméro à supprimer :');
+  const n=parseInt(idx);
+  if(n>=1&&n<=H.length&&confirm(`Supprimer "${H[n-1].name}" ?`)){H.splice(n-1,1);sv();rl();}
+}
+function prevM(){if(cM===0){cM=11;cY--;}else cM--;rl();}
+function nextM(){const nM=tM===11?0:tM+1,nY=tM===11?tY+1:tY;if(cY===nY&&cM===nM)return;if(cM===11){cM=0;cY++;}else cM++;rl();}
+
+document.getElementById('new-name').addEventListener('keydown',e=>{if(e.key==='Enter')commitAdd();if(e.key==='Escape')closeAdd();});
+load();cY=tY;cM=tM;rl();
+</script>
+</body>
+</html>
