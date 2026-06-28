@@ -1,6 +1,363 @@
 <!DOCTYPE html>
-<html lang="fr">
-<head>
+<html lang="fr"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures (htmlToImage undefined) and toPng errors
+            // so the parent always gets a response instead of hanging forever.
+            try {
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0">
 <title>Habit Tracker</title>
@@ -67,7 +424,7 @@ input[type=text]:focus{border-color:#2B9FE0;background:#fff;}
 .drag-handle:active{cursor:grabbing;}
 </style>
 </head>
-<body>
+<body id="artifacts-component-root-html">
 <div id="app">
   <div class="topbar">
     <div></div>
@@ -80,505 +437,543 @@ input[type=text]:focus{border-color:#2B9FE0;background:#fff;}
   </div>
   <div class="month-nav">
     <button class="mnav" onclick="prevM()">
-      <svg width="9" height="14" viewBox="0 0 9 14" fill="none"><path d="M7 1L2 7l5 6" stroke="#999" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <svg width="9" height="14" viewBox="0 0 9 14" fill="none"><path d="M7 1L2 7l5 6" stroke="#999" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg>
     </button>
-    <span class="mlabel" id="mlbl"></span>
-    <button class="mnav" id="nbtn" onclick="nextM()">
-      <svg width="9" height="14" viewBox="0 0 9 14" fill="none"><path d="M2 1l5 6-5 6" stroke="#999" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <span class="mlabel" id="mlbl">Juin 2026</span>
+    <button class="mnav" id="nbtn" onclick="nextM()" style="opacity: 1; pointer-events: all;">
+      <svg width="9" height="14" viewBox="0 0 9 14" fill="none"><path d="M2 1l5 6-5 6" stroke="#999" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg>
     </button>
   </div>
-  <div id="pie-wrap" style="padding:0 14px 16px;"></div>
-  <div id="hlist" class="hlist"></div>
-  <div id="hempty" style="display:none;text-align:center;padding:60px 20px;color:#CCC;font-size:14px;">Appuie sur + pour ajouter une habitude.</div>
-</div>
-
-<button class="fab" onclick="openAdd()">+</button>
-
-<div class="modal-bg" id="modal-bg" onclick="modalBgClick(event)">
-  <div class="modal-sheet">
-    <p style="font-size:17px;font-weight:700;margin-bottom:16px;color:#1C1C1E;">Nouvelle habitude</p>
-    <input type="text" id="new-name" placeholder="Ex: Méditer, Lire, Nager…" maxlength="40" style="margin-bottom:16px;">
-    <p style="font-size:11px;color:#BBB;text-transform:uppercase;letter-spacing:.08em;font-weight:600;margin-bottom:9px;">Couleur</p>
-    <div id="swatches" style="display:flex;gap:9px;flex-wrap:wrap;margin-bottom:20px;"></div>
-    <div style="display:flex;gap:10px;">
-      <button onclick="closeAdd()" style="flex:1;padding:14px;border:1.5px solid #E8E8E8;border-radius:13px;background:none;font-size:14px;cursor:pointer;color:#666;font-family:inherit;">Annuler</button>
-      <button onclick="commitAdd()" style="flex:1;padding:14px;border:none;border-radius:13px;background:#2B9FE0;color:#fff;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;">Ajouter</button>
-    </div>
-  </div>
-</div>
-
-<script>
-const PAL=[
-  {n:'coral', bg:'#FFF0EE',f:'#D05050',b:'#F0B0A8',light:'#FFE0DC'},
-  {n:'blue',  bg:'#EEF3FA',f:'#2E68A0',b:'#88B8D8',light:'#D8EAF8'},
-  {n:'teal',  bg:'#E8F8F4',f:'#228888',b:'#68C8C8',light:'#C0EEE8'},
-  {n:'mint',  bg:'#EAF7EF',f:'#1E8858',b:'#68C098',light:'#C0E8D4'},
-  {n:'sky',   bg:'#E8F3FB',f:'#2078B0',b:'#68B8E0',light:'#C0DEED'},
-  {n:'purple',bg:'#F3EEFA',f:'#6048B8',b:'#A888D8',light:'#DDD0F4'},
-  {n:'amber', bg:'#FFF4E6',f:'#A05808',b:'#D89848',light:'#FFE0A8'},
-  {n:'pink',  bg:'#FEF0FA',f:'#C060A0',b:'#E8A8D8',light:'#FAD8F0'},
-];
-const MN=['January','February','March','April','May','June','July','August','September','October','November','December'];
-const MS=['J','F','M','A','M','J','J','A','S','O','N','D'];
-const MSF=['Jan','Fév','Mar','Avr','Mai','Juin','Juil','Aoû','Sep','Oct','Nov','Déc'];
-let H=[],C={},N={},cY,cM,sc2=PAL[0];
-const now=new Date(),tY=now.getFullYear(),tM=now.getMonth(),tD=now.getDate();
-
-const DEFAULT_H=[{"id":"h1","name":"Musculation","color":"coral","sport":true},{"id":"h2","name":"Running","color":"blue","sport":true},{"id":"h1778141203832","name":"Trail","color":"mint","sport":true},{"id":"h1778141226482","name":"Anglais","color":"purple","sport":false},{"id":"h_social","name":"Social Skill","color":"pink","sport":false,"hasNotes":true}];
-const DEFAULT_C={"2024-11-14_h1":1,"2024-11-15_h1":1,"2024-11-17_h1":1,"2024-11-18_h1":1,"2024-11-20_h1":1,"2024-11-21_h1":1,"2024-11-22_h1":1,"2024-11-25_h1":1,"2024-11-28_h1":1,"2024-11-29_h1":1,"2024-12-05_h1":1,"2024-12-07_h1":1,"2024-12-11_h1":1,"2024-12-12_h1":1,"2024-12-13_h1":1,"2024-12-18_h1":1,"2024-12-19_h1":1,"2024-12-22_h1":1,"2024-12-24_h1":1,"2025-01-06_h1":1,"2025-01-07_h1":1,"2025-01-08_h1":1,"2025-01-13_h1":1,"2025-01-15_h1":1,"2025-01-16_h1":1,"2025-01-17_h1":1,"2025-01-21_h1":1,"2025-01-23_h1":1,"2025-01-25_h1":1,"2025-02-01_h1":1,"2025-02-03_h1":1,"2025-02-05_h1":1,"2025-02-07_h1":1,"2025-02-13_h1":1,"2025-02-16_h1":1,"2025-02-19_h1":1,"2025-02-20_h1":1,"2025-02-21_h1":1,"2025-02-27_h1":1,"2025-03-01_h1":1,"2025-03-08_h1":1,"2025-03-09_h1":1,"2025-03-11_h1":1,"2025-03-14_h1":1,"2025-03-16_h1":1,"2025-03-19_h1":1,"2025-03-21_h1":1,"2025-03-22_h1":1,"2025-03-26_h1":1,"2025-03-27_h1":1,"2025-03-29_h1":1,"2025-03-30_h1":1,"2025-04-06_h1":1,"2025-04-17_h1":1,"2025-04-18_h1":1,"2025-04-19_h1":1,"2025-04-21_h1":1,"2025-04-23_h1":1,"2025-04-24_h1":1,"2025-04-27_h1":1,"2025-05-01_h1":1,"2025-05-04_h1":1,"2025-05-08_h1":1,"2025-05-10_h1":1,"2025-05-12_h1":1,"2025-05-13_h1":1,"2025-05-17_h1":1,"2025-05-19_h1":1,"2025-05-20_h1":1,"2025-05-22_h1":1,"2025-05-24_h1":1,"2025-05-27_h1":1,"2025-06-01_h1":1,"2025-06-02_h1":1,"2025-06-05_h1":1,"2025-06-07_h1":1,"2025-06-11_h1":1,"2025-06-15_h1":1,"2025-06-17_h1":1,"2025-06-18_h1":1,"2025-06-20_h1":1,"2025-06-25_h1":1,"2025-07-01_h1":1,"2025-07-04_h1":1,"2025-07-05_h1":1,"2025-07-06_h1":1,"2025-07-10_h1":1,"2025-07-27_h1":1,"2025-08-02_h1":1,"2025-08-05_h1":1,"2025-08-15_h1":1,"2025-08-16_h1":1,"2025-08-22_h1":1,"2025-09-13_h1":1,"2025-09-14_h1":1,"2025-09-16_h1":1,"2025-09-17_h1":1,"2025-09-19_h1":1,"2025-09-20_h1":1,"2025-09-22_h1":1,"2025-09-24_h1":1,"2025-09-26_h1":1,"2025-09-27_h1":1,"2025-09-28_h1":1,"2025-09-29_h1":1,"2025-10-01_h1":1,"2025-10-02_h1":1,"2025-10-04_h1":1,"2025-10-06_h1":1,"2025-10-08_h1":1,"2025-10-11_h1":1,"2025-10-13_h1":1,"2025-10-15_h1":1,"2025-10-17_h1":1,"2025-10-18_h1":1,"2025-10-19_h1":1,"2025-10-22_h1":1,"2025-10-24_h1":1,"2025-10-25_h1":1,"2025-10-26_h1":1,"2025-10-28_h1":1,"2025-10-30_h1":1,"2025-11-06_h1":1,"2025-11-10_h1":1,"2025-11-11_h1":1,"2025-11-14_h1":1,"2025-11-20_h1":1,"2025-11-22_h1":1,"2025-11-24_h1":1,"2025-11-26_h1":1,"2025-11-30_h1":1,"2025-12-23_h1":1,"2025-12-28_h1":1,"2025-12-31_h1":1,"2026-01-03_h1":1,"2026-01-04_h1":1,"2026-01-05_h1":1,"2026-01-08_h1":1,"2026-01-09_h1":1,"2026-01-10_h1":1,"2026-01-14_h1":1,"2026-01-15_h1":1,"2026-01-17_h1":1,"2026-01-22_h1":1,"2026-01-28_h1":1,"2026-01-29_h1":1,"2026-02-02_h1":1,"2026-02-03_h1":1,"2026-02-10_h1":1,"2026-02-13_h1":1,"2026-03-04_h1":1,"2026-03-07_h1":1,"2026-03-14_h1":1,"2026-03-16_h1":1,"2026-03-18_h1":1,"2026-03-22_h1":1,"2026-03-27_h1":1,"2026-04-01_h1":1,"2026-04-02_h1":1,"2026-04-06_h1":1,"2026-04-08_h1":1,"2026-04-11_h1":1,"2026-04-14_h1":1,"2026-04-17_h1":1,"2026-04-21_h1":1,"2026-04-25_h1":1,"2026-04-05_h2":1,"2026-04-29_h1":1,"2026-04-24_h1":1,"2026-04-10_h1":1,"2026-04-19_h1":1,"2026-04-22_h1":1,"2026-04-12_h2":1,"2026-04-18_h2":1,"2026-04-02_h2":1,"2026-04-08_h2":1,"2026-04-27_h2":1,"2026-03-24_h1":1,"2026-03-30_h1":1,"2026-03-23_h1":1,"2026-03-06_h2":1,"2026-03-21_h2":1,"2026-03-29_h2":1,"2026-03-19_h2":1,"2026-03-17_h2":1,"2026-03-24_h2":1,"2026-02-05_h1":1,"2026-02-08_h1":1,"2026-02-07_h1":1,"2026-02-01_h2":1,"2026-02-07_h2":1,"2026-02-05_h2":1,"2026-02-17_h2":1,"2026-01-23_h1":1,"2026-01-24_h1":1,"2026-01-04_h2":1,"2026-01-11_h2":1,"2026-01-24_h2":1,"2026-01-30_h2":1,"2026-01-28_h2":1,"2025-12-21_h2":1,"2025-12-29_h2":1,"2025-12-21_h1":1,"2025-12-27_h1":1,"2025-12-26_h1":1,"2025-12-11_h1":1,"2025-12-02_h1":1,"2025-12-16_h1":1,"2025-11-02_h1":1,"2025-11-03_h1":1,"2025-11-05_h1":1,"2025-11-07_h1":1,"2025-11-15_h1":1,"2025-11-19_h1":1,"2025-11-08_h2":1,"2025-11-04_h2":1,"2025-10-29_h2":1,"2025-10-22_h2":1,"2025-10-16_h2":1,"2025-10-14_h2":1,"2025-10-10_h2":1,"2025-10-05_h2":1,"2025-10-18_h2":1,"2025-09-30_h2":1,"2025-09-24_h2":1,"2025-09-17_h2":1,"2025-09-20_h2":1,"2025-08-06_h1":1,"2025-08-23_h1":1,"2025-08-30_h1":1,"2025-08-31_h1":1,"2025-08-25_h2":1,"2025-08-06_h2":1,"2025-08-14_h2":1,"2025-08-21_h2":1,"2025-08-29_h2":1,"2025-08-17_h2":1,"2025-08-03_h2":1,"2025-07-02_h1":1,"2025-07-17_h1":1,"2025-07-26_h1":1,"2025-07-02_h2":1,"2025-07-09_h2":1,"2025-07-15_h2":1,"2025-07-06_h2":1,"2025-06-22_h1":1,"2025-06-27_h1":1,"2025-06-28_h1":1,"2025-06-16_h1":1,"2025-06-30_h2":1,"2025-06-10_h2":1,"2025-06-21_h2":1,"2025-06-15_h2":1,"2025-05-09_h1":1,"2025-05-19_h2":1,"2025-05-06_h2":1,"2025-05-14_h2":1,"2025-05-22_h2":1,"2025-05-31_h2":1,"2025-05-17_h2":1,"2025-05-10_h2":1,"2025-04-04_h1":1,"2025-04-09_h1":1,"2025-04-08_h1":1,"2025-04-07_h1":1,"2025-04-22_h2":1,"2025-04-26_h2":1,"2025-03-05_h1":1,"2025-03-06_h1":1,"2025-03-25_h1":1,"2025-03-18_h1":1,"2025-03-23_h2":1,"2025-03-30_h2":1,"2025-02-09_h1":1,"2025-02-08_h1":1,"2025-02-28_h1":1,"2025-02-18_h1":1,"2025-02-24_h1":1,"2025-02-06_h2":1,"2025-02-13_h2":1,"2025-02-26_h2":1,"2025-01-02_h1":1,"2025-01-20_h1":1,"2025-01-26_h1":1,"2025-01-30_h1":1,"2025-01-29_h2":1,"2024-12-06_h1":1,"2024-12-08_h1":1,"2024-12-26_h1":1,"2024-12-01_h2":1,"2024-12-09_h2":1,"2024-12-17_h2":1,"2024-12-24_h2":1,"2024-11-03_h2":1,"2024-11-10_h2":1,"2024-11-17_h2":1,"2024-11-24_h2":1,"2024-10-27_h2":1,"2024-10-21_h2":1,"2024-09-06_h2":1,"2024-09-13_h2":1,"2026-05-03_h2":1,"2026-05-05_h1":1};
-
-function load(){
-  try{H=JSON.parse(localStorage.getItem('hbt5_h')||'null');}catch(e){H=null;}
-  try{C=JSON.parse(localStorage.getItem('hbt5_c')||'null');}catch(e){C=null;}
-  try{N=JSON.parse(localStorage.getItem('hbt5_n')||'null')||{};}catch(e){N={};}
-  if(!H){H=DEFAULT_H;C=DEFAULT_C;sv();}
-  if(!C){C=DEFAULT_C;sv();}
-  // Réinjecte les flags depuis DEFAULT_H
-  H=H.map(h=>{
-    const def=DEFAULT_H.find(d=>d.id===h.id);
-    if(!def) return h;
-    const patch={};
-    if(def.sport===false) patch.sport=false;
-    if(def.hasNotes) patch.hasNotes=true;
-    return Object.assign({},h,patch);
-  });
-  // Ajoute Social Skill si absent
-  if(!H.find(h=>h.id==='h_social')) H.push(DEFAULT_H.find(h=>h.id==='h_social'));
-}
-function sv(){localStorage.setItem('hbt5_h',JSON.stringify(H));localStorage.setItem('hbt5_c',JSON.stringify(C));localStorage.setItem('hbt5_n',JSON.stringify(N));}
-function ck(d,id){return d+'_'+id;}
-function dim(y,m){return new Date(y,m+1,0).getDate();}
-function ds(y,m,d){return `${y}-${String(m+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;}
-function gd(y,m,d,id){return!!C[ck(ds(y,m,d),id)];}
-function cm(id,y,m){let n=0;for(let d=1;d<=dim(y,m);d++)if(gd(y,m,d,id))n++;return n;}
-function pc(h){return PAL.find(p=>p.n===h.color)||PAL[0];}
-function streak(id){
-  let s=0,d=new Date(tY,tM,tD);
-  for(let i=0;i<365;i++){
-    const key=ds(d.getFullYear(),d.getMonth(),d.getDate());
-    if(C[ck(key,id)]){s++;d.setDate(d.getDate()-1);}else break;
-  }
-  return s;
-}
-function tog(y,m,d,id){
-  const k=ck(ds(y,m,d),id);C[k]?delete C[k]:(C[k]=1);sv();rl();
-}
-function last12(){
-  const a=[];for(let i=11;i>=0;i--){let m=tM-i,y=tY;while(m<0){m+=12;y--;}a.push({y,m});}return a;
-}
-
-function buildPieSVG(data,total,size,showLabels){
-  if(!data.length) return `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}"><circle cx="${size/2}" cy="${size/2}" r="${size*0.38}" fill="#F0F0F0"/></svg>`;
-  const cx=size/2,cy=size/2,R=size*0.39,holeR=size*0.225;
-  let angle=-Math.PI/2,slices='',labels='';
-  data.forEach(({c,cnt})=>{
-    const slice=2*Math.PI*(cnt/total);
-    const mid=angle+slice/2;
-    const x1=cx+R*Math.cos(angle),y1=cy+R*Math.sin(angle);
-    angle+=slice;
-    const x2=cx+R*Math.cos(angle),y2=cy+R*Math.sin(angle);
-    const xi1=cx+holeR*Math.cos(angle-slice),yi1=cy+holeR*Math.sin(angle-slice);
-    const xi2=cx+holeR*Math.cos(angle),yi2=cy+holeR*Math.sin(angle);
-    const large=slice>Math.PI?1:0;
-    const path=`M${xi1.toFixed(1)},${yi1.toFixed(1)} L${x1.toFixed(1)},${y1.toFixed(1)} A${R},${R} 0 ${large},1 ${x2.toFixed(1)},${y2.toFixed(1)} L${xi2.toFixed(1)},${yi2.toFixed(1)} A${holeR},${holeR} 0 ${large},0 ${xi1.toFixed(1)},${yi1.toFixed(1)} Z`;
-    slices+=`<path d="${path}" fill="${c.f}" opacity="0.9"/>`;
-    if(showLabels&&cnt/total>0.1){
-      const lx=cx+(R+holeR)/2*Math.cos(mid),ly=cy+(R+holeR)/2*Math.sin(mid);
-      labels+=`<text x="${lx.toFixed(1)}" y="${(ly+3).toFixed(1)}" text-anchor="middle" font-size="${size*0.065}" font-weight="700" fill="#fff" font-family="-apple-system,sans-serif">${Math.round(cnt/total*100)}%</text>`;
-    }
-  });
-  return `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">${slices}${labels}</svg>`;
-}
-
-function renderPie(){
-  const sportH=H.filter(h=>h.sport!==false);
-  const data=sportH.map(h=>({h,c:pc(h),cnt:cm(h.id,cY,cM)})).filter(d=>d.cnt>0);
-  const wrap=document.getElementById('pie-wrap');
-  if(!data.length){wrap.innerHTML='';return;}
-  const total=data.reduce((s,d)=>s+d.cnt,0);
-
-  // Year grid (12 months of cY)
-  const monthTotals=Array.from({length:12},(_,m)=>sportH.reduce((s,h)=>s+cm(h.id,cY,m),0));
-  const maxT=Math.max(...monthTotals,1);
-  const minSz=36,maxSz=70;
-  const yearGrid=Array.from({length:12},(_,m)=>{
-    const mData=sportH.map(h=>({h,c:pc(h),cnt:cm(h.id,cY,m)})).filter(d=>d.cnt>0);
-    const mTotal=monthTotals[m];
-    const sz=mTotal>0?Math.round(minSz+(maxSz-minSz)*(mTotal/maxT)):minSz;
-    const isCur=cY===tY&&m===tM;
-    const isSel=m===cM&&!isCur;
-    const svg=buildPieSVG(mData,mTotal,sz,false);
-    return `<div onclick="goMonth(${cY},${m})" style="display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:3px;cursor:pointer;height:${maxSz+28}px;opacity:${mTotal===0?.25:1};">
-      <div style="position:relative;border-radius:50%;padding:2px;box-sizing:border-box;border:2px solid ${isCur?'#2B9FE0':isSel?'#AAA':'transparent'};">
-        ${svg}
-        ${mTotal>0?`<div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;"><span style="font-size:${sz<45?8:10}px;font-weight:800;color:#1C1C1E;background:rgba(255,255,255,0.82);border-radius:20px;padding:1px 4px;line-height:1.3;">${mTotal}</span></div>`:''}
-      </div>
-      <span style="font-size:9px;font-weight:${isCur?700:500};color:${isCur?'#2B9FE0':'#888'};">${MS[m]}</span>
-    </div>`;
-  }).join('');
-
-  wrap.innerHTML=`
+  <div id="pie-wrap" style="padding:0 14px 16px;">
     <div style="display:flex;justify-content:center;padding:4px 0 4px;">
       <div id="main-pie" onclick="const g=document.getElementById('year-grid-wrap');g.style.display=g.style.display==='none'?'block':'none';" style="cursor:pointer;position:relative;">
-        ${buildPieSVG(data,total,160,true)}
+        <svg width="160" height="160" viewBox="0 0 160 160"><path d="M80.0,44.0 L80.0,17.6 A62.400000000000006,62.400000000000006 0 1,1 19.2,93.9 L44.9,88.0 A36,36 0 1,0 80.0,44.0 Z" fill="#D05050" opacity="0.9"></path><path d="M44.9,88.0 L19.2,93.9 A62.400000000000006,62.400000000000006 0 0,1 80.0,17.6 L80.0,44.0 A36,36 0 0,0 44.9,88.0 Z" fill="#2E68A0" opacity="0.9"></path><text x="118.5" y="113.7" text-anchor="middle" font-size="10.4" font-weight="700" fill="#fff" font-family="-apple-system,sans-serif">71%</text><text x="41.5" y="52.3" text-anchor="middle" font-size="10.4" font-weight="700" fill="#fff" font-family="-apple-system,sans-serif">29%</text></svg>
         <div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;pointer-events:none;">
-          <span style="font-size:20px;font-weight:700;color:#1C1C1E;line-height:1;">${total}</span>
+          <span style="font-size:20px;font-weight:700;color:#1C1C1E;line-height:1;">14</span>
           <span style="font-size:9px;color:#999;">séances</span>
         </div>
       </div>
     </div>
     <div id="year-grid-wrap" style="display:none;padding:0 8px 12px;">
       <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px 6px;padding:10px 4px 4px;">
-        ${yearGrid}
+        <div onclick="goMonth(2026,0)" style="display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:3px;cursor:pointer;height:98px;opacity:1;">
+      <div style="position:relative;border-radius:50%;padding:2px;box-sizing:border-box;border:2px solid transparent;">
+        <svg width="68" height="68" viewBox="0 0 68 68"><path d="M34.0,18.7 L34.0,7.5 A26.52,26.52 0 1,1 7.6,36.2 L18.8,35.3 A15.3,15.3 0 1,0 34.0,18.7 Z" fill="#D05050" opacity="0.9"></path><path d="M18.8,35.3 L7.6,36.2 A26.52,26.52 0 0,1 34.0,7.5 L34.0,18.7 A15.3,15.3 0 0,0 18.8,35.3 Z" fill="#2E68A0" opacity="0.9"></path></svg>
+        <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;"><span style="font-size:10px;font-weight:800;color:#1C1C1E;background:rgba(255,255,255,0.82);border-radius:20px;padding:1px 4px;line-height:1.3;">19</span></div>
       </div>
-    </div>`;
-}
-
-
-function rl(){
-  const D=dim(cY,cM),ic=cY===tY&&cM===tM;
-  document.getElementById('mlbl').textContent=MSF[cM]+' '+cY;
-  const nb=document.getElementById('nbtn');
-  const atMax=(tM===11&&cY===tY+1&&cM===0)||(cY===tY&&cM===tM+1);nb.style.opacity=atMax?'.28':'1';nb.style.pointerEvents=atMax?'none':'all';
-  const el=document.getElementById('hlist'),em=document.getElementById('hempty');
-  if(!H.length){el.innerHTML='';em.style.display='block';return;}
-  em.style.display='none';
-  renderPie();
-
-  el.innerHTML=H.map(h=>{
-    const c=pc(h),cnt=cm(h.id,cY,cM),st=streak(h.id);
-
-    // unified calendar grid: day headers + aligned squares
-    const firstDow=(new Date(cY,cM,1).getDay()+6)%7;
-    const DLBLS=['L','M','M','J','V','S','D'];
-    let cells=DLBLS.map(d=>`<div style="text-align:center;font-size:8px;font-weight:600;color:${c.b};padding-bottom:2px;">${d}</div>`).join('');
-    for(let i=0;i<firstDow;i++) cells+=`<div class="dsq" style="pointer-events:none;background:transparent;"></div>`;
-    for(let day=1;day<=D;day++){
-      const f=gd(cY,cM,day,h.id),fut=(ic&&day>tD)||(cY===tY&&cM>tM)||(cY>tY),isT=ic&&day===tD;
-      const dateStr=ds(cY,cM,day);
-      const nk=dateStr+'_'+h.id;
-      const hasNote=h.hasNotes&&N[nk];
-      const noteDot=hasNote?`<div style="position:absolute;bottom:2px;left:50%;transform:translateX(-50%);width:4px;height:4px;border-radius:50%;background:${f?'rgba(255,255,255,0.9)':c.f};"></div>`:'';
-      const lbl=isT?`<span style="font-size:8px;font-weight:700;line-height:1;color:${f?'#fff':c.f};">${day}</span>`:'';
-      const noteAttr=h.hasNotes&&!fut?` data-note-day="${day}" data-note-hid="${h.id}"`:'' ;
-      const style_done=`position:relative;background:${c.f};display:flex;align-items:center;justify-content:center;`;
-      const style_empty=`position:relative;border:${isT?`2px solid ${c.f}`:`1.5px solid ${c.b}`};display:flex;align-items:center;justify-content:center;`;
-      if(fut) cells+=`<div class="dsq" style="border:1.5px solid ${c.b};opacity:.25;pointer-events:none;"></div>`;
-      else if(h.hasNotes) cells+=`<div class="dsq nsq" style="${f?style_done:style_empty}"${noteAttr} onclick="tog(${cY},${cM},${day},'${h.id}');openNoteModal('${dateStr}','${h.id}')">${lbl}</div>`;
-      else if(f) cells+=`<div class="dsq" style="${style_done}" onclick="tog(${cY},${cM},${day},'${h.id}')">${lbl}</div>`;
-      else cells+=`<div class="dsq" style="${style_empty}" onclick="tog(${cY},${cM},${day},'${h.id}')">${lbl}</div>`;
-    }
-    let sq=cells;
-
-    // 12-month sparkline
-    // Yearly totals
-    const cyTotal=(()=>{let n=0;for(let m=0;m<12;m++)n+=cm(h.id,tY,m);return n;})();
-    const pyTotal=(()=>{let n=0;for(let m=0;m<12;m++)n+=cm(h.id,tY-1,m);return n;})();
-    const diff=cyTotal-pyTotal;
-    const dSign=diff>0?'+':'';
-    const dCol=diff>0?'#34C759':diff<0?'#FF3B30':'#999';
-    const allYears=(()=>{
-      const rows=[];
-      for(let y=tY-2;y>=tY-5;y--){
-        const tot=(()=>{let n=0;for(let m=0;m<12;m++)n+=cm(h.id,y,m);return n;})();
-        if(tot>0)rows.push(`<span style="color:${c.b};font-size:11px;">${y} <strong style="color:${c.f}">${tot}</strong></span>`);
-      }
-      return rows.join('<span style="color:'+c.b+'44;margin:0 4px;">·</span>');
-    })();
-    const uid='yc_'+h.id;
-    const yearlyComp=`<div style="margin-top:7px;padding-top:6px;border-top:1px solid ${c.b}22;">
-      <div onclick="const el=document.getElementById('${uid}');el.style.display=el.style.display==='flex'?'none':'flex'" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-        <span style="font-size:11px;color:${c.b};">${tY-1} <strong style="color:${c.b};font-size:13px;">${pyTotal}</strong></span>
-        <span style="font-size:10px;color:${c.b}44;">→</span>
-        <span style="font-size:11px;color:${c.b};"><strong style="color:${c.f};">${tY}</strong> <span style="color:${c.f};font-size:13px;">${cyTotal}</span></span>
-        <span style="font-size:9px;color:${c.b}44;margin-left:auto;">▾</span>
+      <span style="font-size:9px;font-weight:500;color:#888;">J</span>
+    </div><div onclick="goMonth(2026,1)" style="display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:3px;cursor:pointer;height:98px;opacity:1;">
+      <div style="position:relative;border-radius:50%;padding:2px;box-sizing:border-box;border:2px solid transparent;">
+        <svg width="55" height="55" viewBox="0 0 55 55"><path d="M27.5,15.1 L27.5,6.1 A21.45,21.45 0 1,1 11.3,41.5 L18.1,35.6 A12.375,12.375 0 1,0 27.5,15.1 Z" fill="#D05050" opacity="0.9"></path><path d="M18.1,35.6 L11.3,41.5 A21.45,21.45 0 0,1 27.5,6.1 L27.5,15.1 A12.375,12.375 0 0,0 18.1,35.6 Z" fill="#2E68A0" opacity="0.9"></path></svg>
+        <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;"><span style="font-size:10px;font-weight:800;color:#1C1C1E;background:rgba(255,255,255,0.82);border-radius:20px;padding:1px 4px;line-height:1.3;">11</span></div>
       </div>
-      <div id="${uid}" style="display:none;margin-top:5px;flex-wrap:wrap;gap:6px;">${allYears}</div>
-    </div>`;
-    const m12=last12();
-    const counts=m12.map(({y,m})=>cm(h.id,y,m));
-    const mx=Math.max(...counts,1);
-    const avg=counts.filter(v=>v>0).reduce((a,b)=>a+b,0)/Math.max(counts.filter(v=>v>0).length,1);
-    const avgPx=Math.round(avg/mx*36);
-    const spark='<div style="position:relative;display:flex;align-items:flex-end;gap:3px;height:56px;width:100%;">'
-      +m12.map(({y,m},i)=>{
-        const px=Math.max(Math.round(counts[i]/mx*36),counts[i]>0?4:0);
-        const isCur=y===tY&&m===tM;
-        const isSelected=y===cY&&m===cM&&!isCur;
-        return `<div class="sp-col" onclick="goMonth(${y},${m})">
-        <span style="font-size:8px;font-weight:700;color:${counts[i]>0?(isCur?c.f:c.b):'transparent'};height:10px;line-height:10px;">${counts[i]||''}</span>
-        <div class="sp-bar" style="height:${px}px;background:${isCur?c.f:isSelected?c.f+'BB':c.b};${isCur?'box-shadow:0 0 0 1.5px '+c.f+'44;':''}"></div>
-        <span class="${isCur?'sp-cur':'sp-lbl'}" style="${isCur?'color:'+c.f+';':''}">${MS[m]}</span>
-      </div>`;
-      }).join('')
-      +`<div style="position:absolute;bottom:${avgPx+13}px;left:0;right:0;border-top:1.5px dashed ${c.f}88;pointer-events:none;"></div>`
-      +'</div>';
-
-    const streakBadge=st>=2?`<div class="streak-badge" style="background:${c.light};color:${c.f};">🔥 ${st} jours</div>`:'';
-
-    return `<div class="hcard" data-id="${h.id}" style="border-top:3px solid ${c.f};">
+      <span style="font-size:9px;font-weight:500;color:#888;">F</span>
+    </div><div onclick="goMonth(2026,2)" style="display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:3px;cursor:pointer;height:98px;opacity:1;">
+      <div style="position:relative;border-radius:50%;padding:2px;box-sizing:border-box;border:2px solid transparent;">
+        <svg width="63" height="63" viewBox="0 0 63 63"><path d="M31.5,17.3 L31.5,6.9 A24.57,24.57 0 1,1 14.1,48.9 L21.5,41.5 A14.175,14.175 0 1,0 31.5,17.3 Z" fill="#D05050" opacity="0.9"></path><path d="M21.5,41.5 L14.1,48.9 A24.57,24.57 0 0,1 31.5,6.9 L31.5,17.3 A14.175,14.175 0 0,0 21.5,41.5 Z" fill="#2E68A0" opacity="0.9"></path></svg>
+        <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;"><span style="font-size:10px;font-weight:800;color:#1C1C1E;background:rgba(255,255,255,0.82);border-radius:20px;padding:1px 4px;line-height:1.3;">16</span></div>
+      </div>
+      <span style="font-size:9px;font-weight:500;color:#888;">M</span>
+    </div><div onclick="goMonth(2026,3)" style="display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:3px;cursor:pointer;height:98px;opacity:1;">
+      <div style="position:relative;border-radius:50%;padding:2px;box-sizing:border-box;border:2px solid transparent;">
+        <svg width="70" height="70" viewBox="0 0 70 70"><path d="M35.0,19.3 L35.0,7.7 A27.3,27.3 0 1,1 9.0,43.4 L20.0,39.9 A15.75,15.75 0 1,0 35.0,19.3 Z" fill="#D05050" opacity="0.9"></path><path d="M20.0,39.9 L9.0,43.4 A27.3,27.3 0 0,1 35.0,7.7 L35.0,19.3 A15.75,15.75 0 0,0 20.0,39.9 Z" fill="#2E68A0" opacity="0.9"></path></svg>
+        <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;"><span style="font-size:10px;font-weight:800;color:#1C1C1E;background:rgba(255,255,255,0.82);border-radius:20px;padding:1px 4px;line-height:1.3;">20</span></div>
+      </div>
+      <span style="font-size:9px;font-weight:500;color:#888;">A</span>
+    </div><div onclick="goMonth(2026,4)" style="display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:3px;cursor:pointer;height:98px;opacity:1;">
+      <div style="position:relative;border-radius:50%;padding:2px;box-sizing:border-box;border:2px solid transparent;">
+        <svg width="63" height="63" viewBox="0 0 63 63"><path d="M31.5,17.3 L31.5,6.9 A24.57,24.57 0 1,1 6.9,31.5 L17.3,31.5 A14.175,14.175 0 1,0 31.5,17.3 Z" fill="#D05050" opacity="0.9"></path><path d="M17.3,31.5 L6.9,31.5 A24.57,24.57 0 0,1 31.5,6.9 L31.5,17.3 A14.175,14.175 0 0,0 17.3,31.5 Z" fill="#2E68A0" opacity="0.9"></path></svg>
+        <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;"><span style="font-size:10px;font-weight:800;color:#1C1C1E;background:rgba(255,255,255,0.82);border-radius:20px;padding:1px 4px;line-height:1.3;">16</span></div>
+      </div>
+      <span style="font-size:9px;font-weight:500;color:#888;">M</span>
+    </div><div onclick="goMonth(2026,5)" style="display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:3px;cursor:pointer;height:98px;opacity:1;">
+      <div style="position:relative;border-radius:50%;padding:2px;box-sizing:border-box;border:2px solid #2B9FE0;">
+        <svg width="60" height="60" viewBox="0 0 60 60"><path d="M30.0,16.5 L30.0,6.6 A23.400000000000002,23.400000000000002 0 1,1 7.2,35.2 L16.8,33.0 A13.5,13.5 0 1,0 30.0,16.5 Z" fill="#D05050" opacity="0.9"></path><path d="M16.8,33.0 L7.2,35.2 A23.400000000000002,23.400000000000002 0 0,1 30.0,6.6 L30.0,16.5 A13.5,13.5 0 0,0 16.8,33.0 Z" fill="#2E68A0" opacity="0.9"></path></svg>
+        <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;"><span style="font-size:10px;font-weight:800;color:#1C1C1E;background:rgba(255,255,255,0.82);border-radius:20px;padding:1px 4px;line-height:1.3;">14</span></div>
+      </div>
+      <span style="font-size:9px;font-weight:700;color:#2B9FE0;">J</span>
+    </div><div onclick="goMonth(2026,6)" style="display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:3px;cursor:pointer;height:98px;opacity:0.25;">
+      <div style="position:relative;border-radius:50%;padding:2px;box-sizing:border-box;border:2px solid transparent;">
+        <svg width="36" height="36" viewBox="0 0 36 36"><circle cx="18" cy="18" r="13.68" fill="#F0F0F0"></circle></svg>
+        
+      </div>
+      <span style="font-size:9px;font-weight:500;color:#888;">J</span>
+    </div><div onclick="goMonth(2026,7)" style="display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:3px;cursor:pointer;height:98px;opacity:0.25;">
+      <div style="position:relative;border-radius:50%;padding:2px;box-sizing:border-box;border:2px solid transparent;">
+        <svg width="36" height="36" viewBox="0 0 36 36"><circle cx="18" cy="18" r="13.68" fill="#F0F0F0"></circle></svg>
+        
+      </div>
+      <span style="font-size:9px;font-weight:500;color:#888;">A</span>
+    </div><div onclick="goMonth(2026,8)" style="display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:3px;cursor:pointer;height:98px;opacity:0.25;">
+      <div style="position:relative;border-radius:50%;padding:2px;box-sizing:border-box;border:2px solid transparent;">
+        <svg width="36" height="36" viewBox="0 0 36 36"><circle cx="18" cy="18" r="13.68" fill="#F0F0F0"></circle></svg>
+        
+      </div>
+      <span style="font-size:9px;font-weight:500;color:#888;">S</span>
+    </div><div onclick="goMonth(2026,9)" style="display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:3px;cursor:pointer;height:98px;opacity:0.25;">
+      <div style="position:relative;border-radius:50%;padding:2px;box-sizing:border-box;border:2px solid transparent;">
+        <svg width="36" height="36" viewBox="0 0 36 36"><circle cx="18" cy="18" r="13.68" fill="#F0F0F0"></circle></svg>
+        
+      </div>
+      <span style="font-size:9px;font-weight:500;color:#888;">O</span>
+    </div><div onclick="goMonth(2026,10)" style="display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:3px;cursor:pointer;height:98px;opacity:0.25;">
+      <div style="position:relative;border-radius:50%;padding:2px;box-sizing:border-box;border:2px solid transparent;">
+        <svg width="36" height="36" viewBox="0 0 36 36"><circle cx="18" cy="18" r="13.68" fill="#F0F0F0"></circle></svg>
+        
+      </div>
+      <span style="font-size:9px;font-weight:500;color:#888;">N</span>
+    </div><div onclick="goMonth(2026,11)" style="display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:3px;cursor:pointer;height:98px;opacity:0.25;">
+      <div style="position:relative;border-radius:50%;padding:2px;box-sizing:border-box;border:2px solid transparent;">
+        <svg width="36" height="36" viewBox="0 0 36 36"><circle cx="18" cy="18" r="13.68" fill="#F0F0F0"></circle></svg>
+        
+      </div>
+      <span style="font-size:9px;font-weight:500;color:#888;">D</span>
+    </div>
+      </div>
+    </div></div>
+  <div id="hlist" class="hlist"><div class="hcard" data-id="h1" style="border-top:3px solid #D05050;">
       <div class="card-top">
         <div class="drag-handle" title="Maintenir pour déplacer">⠿</div>
         <div class="card-left">
-          <p class="hname" style="color:${c.f};">${h.name}</p>
+          <p class="hname" style="color:#D05050;">Musculation</p>
           <div class="hcount-row">
-            <span class="hcount-num" style="color:${c.f};">${cnt}</span>
-            <span class="hcount-lbl" style="color:${c.f};">fois ce mois</span>
+            <span class="hcount-num" style="color:#D05050;">10</span>
+            <span class="hcount-lbl" style="color:#D05050;">fois ce mois</span>
           </div>
-          ${streakBadge}
+          
         </div>
-        <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:3px;width:154px;flex-shrink:0;" onclick="event.stopPropagation()">${sq}</div>
+        <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:3px;width:154px;flex-shrink:0;" onclick="event.stopPropagation()"><div style="text-align:center;font-size:8px;font-weight:600;color:#F0B0A8;padding-bottom:2px;">L</div><div style="text-align:center;font-size:8px;font-weight:600;color:#F0B0A8;padding-bottom:2px;">M</div><div style="text-align:center;font-size:8px;font-weight:600;color:#F0B0A8;padding-bottom:2px;">M</div><div style="text-align:center;font-size:8px;font-weight:600;color:#F0B0A8;padding-bottom:2px;">J</div><div style="text-align:center;font-size:8px;font-weight:600;color:#F0B0A8;padding-bottom:2px;">V</div><div style="text-align:center;font-size:8px;font-weight:600;color:#F0B0A8;padding-bottom:2px;">S</div><div style="text-align:center;font-size:8px;font-weight:600;color:#F0B0A8;padding-bottom:2px;">D</div><div class="dsq" style="position:relative;border:1.5px solid #F0B0A8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,1,'h1')"></div><div class="dsq" style="position:relative;border:1.5px solid #F0B0A8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,2,'h1')"></div><div class="dsq" style="position:relative;background:#D05050;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,3,'h1')"></div><div class="dsq" style="position:relative;border:1.5px solid #F0B0A8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,4,'h1')"></div><div class="dsq" style="position:relative;border:1.5px solid #F0B0A8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,5,'h1')"></div><div class="dsq" style="position:relative;background:#D05050;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,6,'h1')"></div><div class="dsq" style="position:relative;background:#D05050;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,7,'h1')"></div><div class="dsq" style="position:relative;border:1.5px solid #F0B0A8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,8,'h1')"></div><div class="dsq" style="position:relative;border:1.5px solid #F0B0A8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,9,'h1')"></div><div class="dsq" style="position:relative;border:1.5px solid #F0B0A8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,10,'h1')"></div><div class="dsq" style="position:relative;background:#D05050;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,11,'h1')"></div><div class="dsq" style="position:relative;border:1.5px solid #F0B0A8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,12,'h1')"></div><div class="dsq" style="position:relative;border:1.5px solid #F0B0A8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,13,'h1')"></div><div class="dsq" style="position:relative;border:1.5px solid #F0B0A8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,14,'h1')"></div><div class="dsq" style="position:relative;background:#D05050;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,15,'h1')"></div><div class="dsq" style="position:relative;border:1.5px solid #F0B0A8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,16,'h1')"></div><div class="dsq" style="position:relative;border:1.5px solid #F0B0A8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,17,'h1')"></div><div class="dsq" style="position:relative;border:1.5px solid #F0B0A8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,18,'h1')"></div><div class="dsq" style="position:relative;background:#D05050;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,19,'h1')"></div><div class="dsq" style="position:relative;background:#D05050;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,20,'h1')"></div><div class="dsq" style="position:relative;border:1.5px solid #F0B0A8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,21,'h1')"></div><div class="dsq" style="position:relative;background:#D05050;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,22,'h1')"></div><div class="dsq" style="position:relative;border:1.5px solid #F0B0A8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,23,'h1')"></div><div class="dsq" style="position:relative;border:1.5px solid #F0B0A8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,24,'h1')"></div><div class="dsq" style="position:relative;background:#D05050;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,25,'h1')"></div><div class="dsq" style="position:relative;border:1.5px solid #F0B0A8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,26,'h1')"></div><div class="dsq" style="position:relative;border:1.5px solid #F0B0A8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,27,'h1')"></div><div class="dsq" style="position:relative;background:#D05050;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,28,'h1')"><span style="font-size:8px;font-weight:700;line-height:1;color:#fff;">28</span></div><div class="dsq" style="border:1.5px solid #F0B0A8;opacity:.25;pointer-events:none;"></div><div class="dsq" style="border:1.5px solid #F0B0A8;opacity:.25;pointer-events:none;"></div></div>
       </div>
       <hr class="card-divider">
       <div class="year-section">
         <p class="year-label">12 derniers mois</p>
-        ${spark}
-          ${yearlyComp}
+        <div style="position:relative;display:flex;align-items:flex-end;gap:3px;height:56px;width:100%;"><div class="sp-col" onclick="goMonth(2025,6)">
+        <span style="font-size:8px;font-weight:700;color:#F0B0A8;height:10px;line-height:10px;">9</span>
+        <div class="sp-bar" style="height:19px;background:#F0B0A8;"></div>
+        <span class="sp-lbl" style="">J</span>
+      </div><div class="sp-col" onclick="goMonth(2025,7)">
+        <span style="font-size:8px;font-weight:700;color:#F0B0A8;height:10px;line-height:10px;">9</span>
+        <div class="sp-bar" style="height:19px;background:#F0B0A8;"></div>
+        <span class="sp-lbl" style="">A</span>
+      </div><div class="sp-col" onclick="goMonth(2025,8)">
+        <span style="font-size:8px;font-weight:700;color:#F0B0A8;height:10px;line-height:10px;">12</span>
+        <div class="sp-bar" style="height:25px;background:#F0B0A8;"></div>
+        <span class="sp-lbl" style="">S</span>
+      </div><div class="sp-col" onclick="goMonth(2025,9)">
+        <span style="font-size:8px;font-weight:700;color:#F0B0A8;height:10px;line-height:10px;">17</span>
+        <div class="sp-bar" style="height:36px;background:#F0B0A8;"></div>
+        <span class="sp-lbl" style="">O</span>
+      </div><div class="sp-col" onclick="goMonth(2025,10)">
+        <span style="font-size:8px;font-weight:700;color:#F0B0A8;height:10px;line-height:10px;">15</span>
+        <div class="sp-bar" style="height:32px;background:#F0B0A8;"></div>
+        <span class="sp-lbl" style="">N</span>
+      </div><div class="sp-col" onclick="goMonth(2025,11)">
+        <span style="font-size:8px;font-weight:700;color:#F0B0A8;height:10px;line-height:10px;">9</span>
+        <div class="sp-bar" style="height:19px;background:#F0B0A8;"></div>
+        <span class="sp-lbl" style="">D</span>
+      </div><div class="sp-col" onclick="goMonth(2026,0)">
+        <span style="font-size:8px;font-weight:700;color:#F0B0A8;height:10px;line-height:10px;">14</span>
+        <div class="sp-bar" style="height:30px;background:#F0B0A8;"></div>
+        <span class="sp-lbl" style="">J</span>
+      </div><div class="sp-col" onclick="goMonth(2026,1)">
+        <span style="font-size:8px;font-weight:700;color:#F0B0A8;height:10px;line-height:10px;">7</span>
+        <div class="sp-bar" style="height:15px;background:#F0B0A8;"></div>
+        <span class="sp-lbl" style="">F</span>
+      </div><div class="sp-col" onclick="goMonth(2026,2)">
+        <span style="font-size:8px;font-weight:700;color:#F0B0A8;height:10px;line-height:10px;">10</span>
+        <div class="sp-bar" style="height:21px;background:#F0B0A8;"></div>
+        <span class="sp-lbl" style="">M</span>
+      </div><div class="sp-col" onclick="goMonth(2026,3)">
+        <span style="font-size:8px;font-weight:700;color:#F0B0A8;height:10px;line-height:10px;">14</span>
+        <div class="sp-bar" style="height:30px;background:#F0B0A8;"></div>
+        <span class="sp-lbl" style="">A</span>
+      </div><div class="sp-col" onclick="goMonth(2026,4)">
+        <span style="font-size:8px;font-weight:700;color:#F0B0A8;height:10px;line-height:10px;">12</span>
+        <div class="sp-bar" style="height:25px;background:#F0B0A8;"></div>
+        <span class="sp-lbl" style="">M</span>
+      </div><div class="sp-col" onclick="goMonth(2026,5)">
+        <span style="font-size:8px;font-weight:700;color:#D05050;height:10px;line-height:10px;">10</span>
+        <div class="sp-bar" style="height:21px;background:#D05050;box-shadow:0 0 0 1.5px #D0505044;"></div>
+        <span class="sp-cur" style="color:#D05050;">J</span>
+      </div><div style="position:absolute;bottom:37px;left:0;right:0;border-top:1.5px dashed #D0505088;pointer-events:none;"></div></div>
+          <div style="margin-top:7px;padding-top:6px;border-top:1px solid #F0B0A822;">
+      <div onclick="const el=document.getElementById('yc_h1');el.style.display=el.style.display==='flex'?'none':'flex'" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+        <span style="font-size:11px;color:#F0B0A8;">2025 <strong style="color:#F0B0A8;font-size:13px;">156</strong></span>
+        <span style="font-size:10px;color:#F0B0A844;">→</span>
+        <span style="font-size:11px;color:#F0B0A8;"><strong style="color:#D05050;">2026</strong> <span style="color:#D05050;font-size:13px;">67</span></span>
+        <span style="font-size:9px;color:#F0B0A844;margin-left:auto;">▾</span>
       </div>
-    </div>`;
-  }).join('');
-  initDrag();
-}
-
-function goMonth(y,m){cY=y;cM=m;rl();}
-
-function initNotes(){
-  document.querySelectorAll('.nsq[data-note-day]').forEach(sq=>{
-    let timer=null, triggered=false;
-    const day=parseInt(sq.dataset.noteDay);
-    const hid=sq.dataset.noteHid;
-
-    const startPress=()=>{ triggered=false; timer=setTimeout(()=>{ triggered=true; if(navigator.vibrate)navigator.vibrate(40); openNoteModal(ds(cY,cM,day),hid); },450); };
-    const endPress=()=>{ clearTimeout(timer); };
-    const doClick=()=>{ if(!triggered) tog(cY,cM,day,hid); };
-
-    sq.addEventListener('mousedown', startPress);
-    sq.addEventListener('mouseup', endPress);
-    sq.addEventListener('click', doClick);
-    sq.addEventListener('touchstart', startPress, {passive:true});
-    sq.addEventListener('touchend', e=>{ endPress(); if(!triggered){ e.preventDefault(); tog(cY,cM,day,hid); } }, {passive:false});
-    sq.addEventListener('touchmove', ()=>{ clearTimeout(timer); triggered=true; }, {passive:true});
-  });
-}
-
-function openNoteModal(dateStr,hid){
-  const h=H.find(x=>x.id===hid);
-  const c=pc(h);
-  const nk=dateStr+'_'+hid;
-  const existing=N[nk]||'';
-  const [yr,mo,dy]=dateStr.split('-');
-  const label=`${parseInt(dy)} ${MSF[parseInt(mo)-1]} ${yr}`;
-  const ov=document.createElement('div');
-  ov.id='note-modal';
-  ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:1000;display:flex;align-items:flex-end;justify-content:center;padding:0 0 20px;';
-  ov.innerHTML=`<div style="background:#fff;border-radius:24px 24px 20px 20px;padding:20px;width:100%;max-width:520px;display:flex;flex-direction:column;gap:12px;">
-    <div style="display:flex;align-items:center;justify-content:space-between;">
-      <div>
-        <p style="font-size:13px;font-weight:700;color:${c.f};">✦ Social Skill</p>
-        <p style="font-size:12px;color:#999;margin-top:1px;">${label}</p>
+      <div id="yc_h1" style="display:none;margin-top:5px;flex-wrap:wrap;gap:6px;"><span style="color:#F0B0A8;font-size:11px;">2024 <strong style="color:#D05050">22</strong></span></div>
+    </div>
       </div>
-      <button onclick="document.getElementById('note-modal').remove()" style="background:none;border:none;font-size:24px;color:#BBB;cursor:pointer;line-height:1;">×</button>
+    </div><div class="hcard" data-id="h2" style="border-top:3px solid #2E68A0;">
+      <div class="card-top">
+        <div class="drag-handle" title="Maintenir pour déplacer">⠿</div>
+        <div class="card-left">
+          <p class="hname" style="color:#2E68A0;">Running</p>
+          <div class="hcount-row">
+            <span class="hcount-num" style="color:#2E68A0;">4</span>
+            <span class="hcount-lbl" style="color:#2E68A0;">fois ce mois</span>
+          </div>
+          
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:3px;width:154px;flex-shrink:0;" onclick="event.stopPropagation()"><div style="text-align:center;font-size:8px;font-weight:600;color:#88B8D8;padding-bottom:2px;">L</div><div style="text-align:center;font-size:8px;font-weight:600;color:#88B8D8;padding-bottom:2px;">M</div><div style="text-align:center;font-size:8px;font-weight:600;color:#88B8D8;padding-bottom:2px;">M</div><div style="text-align:center;font-size:8px;font-weight:600;color:#88B8D8;padding-bottom:2px;">J</div><div style="text-align:center;font-size:8px;font-weight:600;color:#88B8D8;padding-bottom:2px;">V</div><div style="text-align:center;font-size:8px;font-weight:600;color:#88B8D8;padding-bottom:2px;">S</div><div style="text-align:center;font-size:8px;font-weight:600;color:#88B8D8;padding-bottom:2px;">D</div><div class="dsq" style="position:relative;border:1.5px solid #88B8D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,1,'h2')"></div><div class="dsq" style="position:relative;border:1.5px solid #88B8D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,2,'h2')"></div><div class="dsq" style="position:relative;background:#2E68A0;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,3,'h2')"></div><div class="dsq" style="position:relative;border:1.5px solid #88B8D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,4,'h2')"></div><div class="dsq" style="position:relative;border:1.5px solid #88B8D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,5,'h2')"></div><div class="dsq" style="position:relative;border:1.5px solid #88B8D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,6,'h2')"></div><div class="dsq" style="position:relative;border:1.5px solid #88B8D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,7,'h2')"></div><div class="dsq" style="position:relative;border:1.5px solid #88B8D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,8,'h2')"></div><div class="dsq" style="position:relative;background:#2E68A0;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,9,'h2')"></div><div class="dsq" style="position:relative;border:1.5px solid #88B8D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,10,'h2')"></div><div class="dsq" style="position:relative;border:1.5px solid #88B8D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,11,'h2')"></div><div class="dsq" style="position:relative;border:1.5px solid #88B8D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,12,'h2')"></div><div class="dsq" style="position:relative;border:1.5px solid #88B8D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,13,'h2')"></div><div class="dsq" style="position:relative;border:1.5px solid #88B8D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,14,'h2')"></div><div class="dsq" style="position:relative;border:1.5px solid #88B8D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,15,'h2')"></div><div class="dsq" style="position:relative;border:1.5px solid #88B8D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,16,'h2')"></div><div class="dsq" style="position:relative;background:#2E68A0;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,17,'h2')"></div><div class="dsq" style="position:relative;border:1.5px solid #88B8D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,18,'h2')"></div><div class="dsq" style="position:relative;border:1.5px solid #88B8D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,19,'h2')"></div><div class="dsq" style="position:relative;border:1.5px solid #88B8D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,20,'h2')"></div><div class="dsq" style="position:relative;border:1.5px solid #88B8D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,21,'h2')"></div><div class="dsq" style="position:relative;border:1.5px solid #88B8D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,22,'h2')"></div><div class="dsq" style="position:relative;border:1.5px solid #88B8D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,23,'h2')"></div><div class="dsq" style="position:relative;background:#2E68A0;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,24,'h2')"></div><div class="dsq" style="position:relative;border:1.5px solid #88B8D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,25,'h2')"></div><div class="dsq" style="position:relative;border:1.5px solid #88B8D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,26,'h2')"></div><div class="dsq" style="position:relative;border:1.5px solid #88B8D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,27,'h2')"></div><div class="dsq" style="position:relative;border:2px solid #2E68A0;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,28,'h2')"><span style="font-size:8px;font-weight:700;line-height:1;color:#2E68A0;">28</span></div><div class="dsq" style="border:1.5px solid #88B8D8;opacity:.25;pointer-events:none;"></div><div class="dsq" style="border:1.5px solid #88B8D8;opacity:.25;pointer-events:none;"></div></div>
+      </div>
+      <hr class="card-divider">
+      <div class="year-section">
+        <p class="year-label">12 derniers mois</p>
+        <div style="position:relative;display:flex;align-items:flex-end;gap:3px;height:56px;width:100%;"><div class="sp-col" onclick="goMonth(2025,6)">
+        <span style="font-size:8px;font-weight:700;color:#88B8D8;height:10px;line-height:10px;">4</span>
+        <div class="sp-bar" style="height:21px;background:#88B8D8;"></div>
+        <span class="sp-lbl" style="">J</span>
+      </div><div class="sp-col" onclick="goMonth(2025,7)">
+        <span style="font-size:8px;font-weight:700;color:#88B8D8;height:10px;line-height:10px;">7</span>
+        <div class="sp-bar" style="height:36px;background:#88B8D8;"></div>
+        <span class="sp-lbl" style="">A</span>
+      </div><div class="sp-col" onclick="goMonth(2025,8)">
+        <span style="font-size:8px;font-weight:700;color:#88B8D8;height:10px;line-height:10px;">4</span>
+        <div class="sp-bar" style="height:21px;background:#88B8D8;"></div>
+        <span class="sp-lbl" style="">S</span>
+      </div><div class="sp-col" onclick="goMonth(2025,9)">
+        <span style="font-size:8px;font-weight:700;color:#88B8D8;height:10px;line-height:10px;">7</span>
+        <div class="sp-bar" style="height:36px;background:#88B8D8;"></div>
+        <span class="sp-lbl" style="">O</span>
+      </div><div class="sp-col" onclick="goMonth(2025,10)">
+        <span style="font-size:8px;font-weight:700;color:#88B8D8;height:10px;line-height:10px;">2</span>
+        <div class="sp-bar" style="height:10px;background:#88B8D8;"></div>
+        <span class="sp-lbl" style="">N</span>
+      </div><div class="sp-col" onclick="goMonth(2025,11)">
+        <span style="font-size:8px;font-weight:700;color:#88B8D8;height:10px;line-height:10px;">2</span>
+        <div class="sp-bar" style="height:10px;background:#88B8D8;"></div>
+        <span class="sp-lbl" style="">D</span>
+      </div><div class="sp-col" onclick="goMonth(2026,0)">
+        <span style="font-size:8px;font-weight:700;color:#88B8D8;height:10px;line-height:10px;">5</span>
+        <div class="sp-bar" style="height:26px;background:#88B8D8;"></div>
+        <span class="sp-lbl" style="">J</span>
+      </div><div class="sp-col" onclick="goMonth(2026,1)">
+        <span style="font-size:8px;font-weight:700;color:#88B8D8;height:10px;line-height:10px;">4</span>
+        <div class="sp-bar" style="height:21px;background:#88B8D8;"></div>
+        <span class="sp-lbl" style="">F</span>
+      </div><div class="sp-col" onclick="goMonth(2026,2)">
+        <span style="font-size:8px;font-weight:700;color:#88B8D8;height:10px;line-height:10px;">6</span>
+        <div class="sp-bar" style="height:31px;background:#88B8D8;"></div>
+        <span class="sp-lbl" style="">M</span>
+      </div><div class="sp-col" onclick="goMonth(2026,3)">
+        <span style="font-size:8px;font-weight:700;color:#88B8D8;height:10px;line-height:10px;">6</span>
+        <div class="sp-bar" style="height:31px;background:#88B8D8;"></div>
+        <span class="sp-lbl" style="">A</span>
+      </div><div class="sp-col" onclick="goMonth(2026,4)">
+        <span style="font-size:8px;font-weight:700;color:#88B8D8;height:10px;line-height:10px;">4</span>
+        <div class="sp-bar" style="height:21px;background:#88B8D8;"></div>
+        <span class="sp-lbl" style="">M</span>
+      </div><div class="sp-col" onclick="goMonth(2026,5)">
+        <span style="font-size:8px;font-weight:700;color:#2E68A0;height:10px;line-height:10px;">4</span>
+        <div class="sp-bar" style="height:21px;background:#2E68A0;box-shadow:0 0 0 1.5px #2E68A044;"></div>
+        <span class="sp-cur" style="color:#2E68A0;">J</span>
+      </div><div style="position:absolute;bottom:37px;left:0;right:0;border-top:1.5px dashed #2E68A088;pointer-events:none;"></div></div>
+          <div style="margin-top:7px;padding-top:6px;border-top:1px solid #88B8D822;">
+      <div onclick="const el=document.getElementById('yc_h2');el.style.display=el.style.display==='flex'?'none':'flex'" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+        <span style="font-size:11px;color:#88B8D8;">2025 <strong style="color:#88B8D8;font-size:13px;">45</strong></span>
+        <span style="font-size:10px;color:#88B8D844;">→</span>
+        <span style="font-size:11px;color:#88B8D8;"><strong style="color:#2E68A0;">2026</strong> <span style="color:#2E68A0;font-size:13px;">29</span></span>
+        <span style="font-size:9px;color:#88B8D844;margin-left:auto;">▾</span>
+      </div>
+      <div id="yc_h2" style="display:none;margin-top:5px;flex-wrap:wrap;gap:6px;"><span style="color:#88B8D8;font-size:11px;">2024 <strong style="color:#2E68A0">12</strong></span></div>
     </div>
-    <textarea id="note-ta" placeholder="Décris l'action réalisée…" style="height:130px;padding:12px;border:1.5px solid ${c.light};border-radius:14px;font-size:14px;font-family:-apple-system,sans-serif;resize:none;outline:none;color:#333;background:#FAFAFA;line-height:1.5;">${existing}</textarea>
-    <div style="display:flex;gap:10px;">
-      ${existing?`<button onclick="const nk='${dateStr}_${hid}';delete N[nk];sv();document.getElementById('note-modal').remove();rl();" style="padding:13px 16px;border:none;border-radius:13px;background:#FFE0E0;color:#D04040;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;">Supprimer</button>`:''}
-      <button onclick="const v=document.getElementById('note-ta').value.trim();if(v){N['${nk}']=v;sv();}else{delete N['${nk}'];sv();}document.getElementById('note-modal').remove();rl();" style="flex:1;padding:13px;border:none;border-radius:13px;background:${c.f};color:#fff;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;">Enregistrer</button>
+      </div>
+    </div><div class="hcard" data-id="h1782665551478" style="border-top:3px solid #228888;">
+      <div class="card-top">
+        <div class="drag-handle" title="Maintenir pour déplacer">⠿</div>
+        <div class="card-left">
+          <p class="hname" style="color:#228888;">Mobilité</p>
+          <div class="hcount-row">
+            <span class="hcount-num" style="color:#228888;">0</span>
+            <span class="hcount-lbl" style="color:#228888;">fois ce mois</span>
+          </div>
+          
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:3px;width:154px;flex-shrink:0;" onclick="event.stopPropagation()"><div style="text-align:center;font-size:8px;font-weight:600;color:#68C8C8;padding-bottom:2px;">L</div><div style="text-align:center;font-size:8px;font-weight:600;color:#68C8C8;padding-bottom:2px;">M</div><div style="text-align:center;font-size:8px;font-weight:600;color:#68C8C8;padding-bottom:2px;">M</div><div style="text-align:center;font-size:8px;font-weight:600;color:#68C8C8;padding-bottom:2px;">J</div><div style="text-align:center;font-size:8px;font-weight:600;color:#68C8C8;padding-bottom:2px;">V</div><div style="text-align:center;font-size:8px;font-weight:600;color:#68C8C8;padding-bottom:2px;">S</div><div style="text-align:center;font-size:8px;font-weight:600;color:#68C8C8;padding-bottom:2px;">D</div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,1,'h1782665551478')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,2,'h1782665551478')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,3,'h1782665551478')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,4,'h1782665551478')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,5,'h1782665551478')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,6,'h1782665551478')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,7,'h1782665551478')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,8,'h1782665551478')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,9,'h1782665551478')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,10,'h1782665551478')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,11,'h1782665551478')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,12,'h1782665551478')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,13,'h1782665551478')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,14,'h1782665551478')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,15,'h1782665551478')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,16,'h1782665551478')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,17,'h1782665551478')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,18,'h1782665551478')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,19,'h1782665551478')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,20,'h1782665551478')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,21,'h1782665551478')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,22,'h1782665551478')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,23,'h1782665551478')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,24,'h1782665551478')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,25,'h1782665551478')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,26,'h1782665551478')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C8C8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,27,'h1782665551478')"></div><div class="dsq" style="position:relative;border:2px solid #228888;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,28,'h1782665551478')"><span style="font-size:8px;font-weight:700;line-height:1;color:#228888;">28</span></div><div class="dsq" style="border:1.5px solid #68C8C8;opacity:.25;pointer-events:none;"></div><div class="dsq" style="border:1.5px solid #68C8C8;opacity:.25;pointer-events:none;"></div></div>
+      </div>
+      <hr class="card-divider">
+      <div class="year-section">
+        <p class="year-label">12 derniers mois</p>
+        <div style="position:relative;display:flex;align-items:flex-end;gap:3px;height:56px;width:100%;"><div class="sp-col" onclick="goMonth(2025,6)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#68C8C8;"></div>
+        <span class="sp-lbl" style="">J</span>
+      </div><div class="sp-col" onclick="goMonth(2025,7)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#68C8C8;"></div>
+        <span class="sp-lbl" style="">A</span>
+      </div><div class="sp-col" onclick="goMonth(2025,8)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#68C8C8;"></div>
+        <span class="sp-lbl" style="">S</span>
+      </div><div class="sp-col" onclick="goMonth(2025,9)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#68C8C8;"></div>
+        <span class="sp-lbl" style="">O</span>
+      </div><div class="sp-col" onclick="goMonth(2025,10)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#68C8C8;"></div>
+        <span class="sp-lbl" style="">N</span>
+      </div><div class="sp-col" onclick="goMonth(2025,11)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#68C8C8;"></div>
+        <span class="sp-lbl" style="">D</span>
+      </div><div class="sp-col" onclick="goMonth(2026,0)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#68C8C8;"></div>
+        <span class="sp-lbl" style="">J</span>
+      </div><div class="sp-col" onclick="goMonth(2026,1)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#68C8C8;"></div>
+        <span class="sp-lbl" style="">F</span>
+      </div><div class="sp-col" onclick="goMonth(2026,2)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#68C8C8;"></div>
+        <span class="sp-lbl" style="">M</span>
+      </div><div class="sp-col" onclick="goMonth(2026,3)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#68C8C8;"></div>
+        <span class="sp-lbl" style="">A</span>
+      </div><div class="sp-col" onclick="goMonth(2026,4)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#68C8C8;"></div>
+        <span class="sp-lbl" style="">M</span>
+      </div><div class="sp-col" onclick="goMonth(2026,5)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#228888;box-shadow:0 0 0 1.5px #22888844;"></div>
+        <span class="sp-cur" style="color:#228888;">J</span>
+      </div><div style="position:absolute;bottom:13px;left:0;right:0;border-top:1.5px dashed #22888888;pointer-events:none;"></div></div>
+          <div style="margin-top:7px;padding-top:6px;border-top:1px solid #68C8C822;">
+      <div onclick="const el=document.getElementById('yc_h1782665551478');el.style.display=el.style.display==='flex'?'none':'flex'" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+        <span style="font-size:11px;color:#68C8C8;">2025 <strong style="color:#68C8C8;font-size:13px;">0</strong></span>
+        <span style="font-size:10px;color:#68C8C844;">→</span>
+        <span style="font-size:11px;color:#68C8C8;"><strong style="color:#228888;">2026</strong> <span style="color:#228888;font-size:13px;">0</span></span>
+        <span style="font-size:9px;color:#68C8C844;margin-left:auto;">▾</span>
+      </div>
+      <div id="yc_h1782665551478" style="display:none;margin-top:5px;flex-wrap:wrap;gap:6px;"></div>
     </div>
-  </div>`;
-  document.body.appendChild(ov);
-  ov.addEventListener('click',e=>{if(e.target===ov)ov.remove();});
-  setTimeout(()=>document.getElementById('note-ta').focus(),100);
-}
-
-// ── Drag & drop ──────────────────────────────────────────────────
-let dragSrcId=null;
-
-function initDrag(){
-  const list=document.getElementById('hlist');
-  const cards=[...list.querySelectorAll('.hcard')];
-
-  cards.forEach(card=>{
-    const handle=card.querySelector('.drag-handle');
-
-    // ── Mouse drag ──
-    handle.addEventListener('mousedown',e=>{
-      card.setAttribute('draggable','true');
-    });
-    card.addEventListener('dragstart',e=>{
-      dragSrcId=card.dataset.id;
-      setTimeout(()=>card.classList.add('dragging'),0);
-      e.dataTransfer.effectAllowed='move';
-    });
-    card.addEventListener('dragend',()=>{
-      card.classList.remove('dragging');
-      card.removeAttribute('draggable');
-      list.querySelectorAll('.hcard').forEach(c=>c.classList.remove('drag-over'));
-    });
-    card.addEventListener('dragover',e=>{
-      e.preventDefault();
-      list.querySelectorAll('.hcard').forEach(c=>c.classList.remove('drag-over'));
-      if(card.dataset.id!==dragSrcId) card.classList.add('drag-over');
-    });
-    card.addEventListener('drop',e=>{
-      e.preventDefault();
-      card.classList.remove('drag-over');
-      if(!dragSrcId||dragSrcId===card.dataset.id) return;
-      const fromIdx=H.findIndex(h=>h.id===dragSrcId);
-      const toIdx=H.findIndex(h=>h.id===card.dataset.id);
-      if(fromIdx<0||toIdx<0) return;
-      const [moved]=H.splice(fromIdx,1);
-      H.splice(toIdx,0,moved);
-      sv(); rl();
-    });
-
-    // ── Touch drag (long press) ──
-    let pressTimer=null, touchClone=null, active=false;
-
-    handle.addEventListener('touchstart',e=>{
-      const touch=e.touches[0];
-      pressTimer=setTimeout(()=>{
-        active=true;
-        dragSrcId=card.dataset.id;
-        card.classList.add('dragging');
-        // clone flottant
-        touchClone=card.cloneNode(true);
-        touchClone.style.cssText=`position:fixed;width:${card.offsetWidth}px;opacity:.85;pointer-events:none;z-index:9999;box-shadow:0 8px 24px rgba(0,0,0,.18);border-radius:20px;top:${card.getBoundingClientRect().top}px;left:${card.getBoundingClientRect().left}px;transition:none;`;
-        document.body.appendChild(touchClone);
-        if(navigator.vibrate) navigator.vibrate(40);
-      },400);
-    },{passive:true});
-
-    handle.addEventListener('touchmove',e=>{
-      clearTimeout(pressTimer);
-      if(!active) return;
-      e.preventDefault();
-      const touch=e.touches[0];
-      touchClone.style.top=(touch.clientY-40)+'px';
-      touchClone.style.left=(touch.clientX-card.offsetWidth/2)+'px';
-      // trouver la cible
-      touchClone.style.display='none';
-      const el=document.elementFromPoint(touch.clientX,touch.clientY);
-      touchClone.style.display='';
-      const target=el&&el.closest('.hcard');
-      list.querySelectorAll('.hcard').forEach(c=>c.classList.remove('drag-over'));
-      if(target&&target.dataset.id!==dragSrcId) target.classList.add('drag-over');
-    },{passive:false});
-
-    const endTouch=e=>{
-      clearTimeout(pressTimer);
-      if(!active){active=false;return;}
-      active=false;
-      if(touchClone){touchClone.remove();touchClone=null;}
-      card.classList.remove('dragging');
-      const over=list.querySelector('.hcard.drag-over');
-      list.querySelectorAll('.hcard').forEach(c=>c.classList.remove('drag-over'));
-      if(over&&dragSrcId&&over.dataset.id!==dragSrcId){
-        const fromIdx=H.findIndex(h=>h.id===dragSrcId);
-        const toIdx=H.findIndex(h=>h.id===over.dataset.id);
-        if(fromIdx>=0&&toIdx>=0){
-          const [moved]=H.splice(fromIdx,1);
-          H.splice(toIdx,0,moved);
-          sv(); rl();
-        }
-      }
-      dragSrcId=null;
-    };
-    handle.addEventListener('touchend',endTouch,{passive:true});
-    handle.addEventListener('touchcancel',endTouch,{passive:true});
-  });
-}
-
-let sc3=PAL[0];
-function openAdd(){sc3=PAL[0];document.getElementById('new-name').value='';rcs();document.getElementById('modal-bg').classList.add('open');setTimeout(()=>document.getElementById('new-name').focus(),200);}
-function closeAdd(){document.getElementById('modal-bg').classList.remove('open');}
-function modalBgClick(e){if(e.target===document.getElementById('modal-bg'))closeAdd();}
-function rcs(){document.getElementById('swatches').innerHTML=PAL.map(c=>`<div class="swatch ${sc3.n===c.n?'sel':''}" style="background:${c.f};" onclick="sc3=PAL.find(p=>p.n==='${c.n}');rcs()"></div>`).join('');}
-function commitAdd(){const name=document.getElementById('new-name').value.trim();if(!name)return;H.push({id:'h'+Date.now(),name,color:sc3.n});sv();closeAdd();rl();}
-
-function doExportHTML(){
-  let src=document.documentElement.outerHTML;
-  const hJson=JSON.stringify(H);
-  const cJson=JSON.stringify(C);
-  // Remplace DEFAULT_H et DEFAULT_C avec les données actuelles
-  src=src.replace(/const DEFAULT_H=\[.*?\];/s,`const DEFAULT_H=${hJson};`);
-  src=src.replace(/const DEFAULT_C=\{.*?\};/s,`const DEFAULT_C=${cJson};`);
-  // Vide le localStorage injecté dans le DOM (repart des defaults proprement)
-  src=src.replace(/<script>const PAL/,'<script>\nlocalStorage.removeItem(\'hbt5_h\');\nlocalStorage.removeItem(\'hbt5_c\');\nconst PAL');
-  const blob=new Blob(['<!DOCTYPE html>\n'+src],{type:'text/html'});
-  const a=document.createElement('a');
-  a.href=URL.createObjectURL(blob);
-  a.download='habit_tracker_'+new Date().toISOString().slice(0,10)+'.html';
-  a.click();
-  URL.revokeObjectURL(a.href);
-}
-
-function doImport(){
-  const ov=document.createElement('div');
-  ov.id='imp-modal';
-  ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:999;display:flex;align-items:center;justify-content:center;padding:20px;';
-  ov.innerHTML=`<div style="background:#fff;border-radius:16px;padding:20px;width:100%;max-width:440px;display:flex;flex-direction:column;gap:12px;">
-    <div style="display:flex;align-items:center;justify-content:space-between;">
-      <p style="font-size:15px;font-weight:600;color:#1C1C1E;">📥 Importer depuis Notion</p>
-      <button onclick="document.getElementById('imp-modal').remove()" style="background:none;border:none;cursor:pointer;font-size:22px;color:#999;">×</button>
+      </div>
+    </div><div class="hcard" data-id="h1782665757648" style="border-top:3px solid #A05808;">
+      <div class="card-top">
+        <div class="drag-handle" title="Maintenir pour déplacer">⠿</div>
+        <div class="card-left">
+          <p class="hname" style="color:#A05808;">Kiné développement</p>
+          <div class="hcount-row">
+            <span class="hcount-num" style="color:#A05808;">0</span>
+            <span class="hcount-lbl" style="color:#A05808;">fois ce mois</span>
+          </div>
+          
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:3px;width:154px;flex-shrink:0;" onclick="event.stopPropagation()"><div style="text-align:center;font-size:8px;font-weight:600;color:#D89848;padding-bottom:2px;">L</div><div style="text-align:center;font-size:8px;font-weight:600;color:#D89848;padding-bottom:2px;">M</div><div style="text-align:center;font-size:8px;font-weight:600;color:#D89848;padding-bottom:2px;">M</div><div style="text-align:center;font-size:8px;font-weight:600;color:#D89848;padding-bottom:2px;">J</div><div style="text-align:center;font-size:8px;font-weight:600;color:#D89848;padding-bottom:2px;">V</div><div style="text-align:center;font-size:8px;font-weight:600;color:#D89848;padding-bottom:2px;">S</div><div style="text-align:center;font-size:8px;font-weight:600;color:#D89848;padding-bottom:2px;">D</div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="1" data-note-hid="h1782665757648" onclick="tog(2026,5,1,'h1782665757648');openNoteModal('2026-06-01','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="2" data-note-hid="h1782665757648" onclick="tog(2026,5,2,'h1782665757648');openNoteModal('2026-06-02','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="3" data-note-hid="h1782665757648" onclick="tog(2026,5,3,'h1782665757648');openNoteModal('2026-06-03','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="4" data-note-hid="h1782665757648" onclick="tog(2026,5,4,'h1782665757648');openNoteModal('2026-06-04','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="5" data-note-hid="h1782665757648" onclick="tog(2026,5,5,'h1782665757648');openNoteModal('2026-06-05','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="6" data-note-hid="h1782665757648" onclick="tog(2026,5,6,'h1782665757648');openNoteModal('2026-06-06','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="7" data-note-hid="h1782665757648" onclick="tog(2026,5,7,'h1782665757648');openNoteModal('2026-06-07','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="8" data-note-hid="h1782665757648" onclick="tog(2026,5,8,'h1782665757648');openNoteModal('2026-06-08','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="9" data-note-hid="h1782665757648" onclick="tog(2026,5,9,'h1782665757648');openNoteModal('2026-06-09','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="10" data-note-hid="h1782665757648" onclick="tog(2026,5,10,'h1782665757648');openNoteModal('2026-06-10','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="11" data-note-hid="h1782665757648" onclick="tog(2026,5,11,'h1782665757648');openNoteModal('2026-06-11','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="12" data-note-hid="h1782665757648" onclick="tog(2026,5,12,'h1782665757648');openNoteModal('2026-06-12','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="13" data-note-hid="h1782665757648" onclick="tog(2026,5,13,'h1782665757648');openNoteModal('2026-06-13','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="14" data-note-hid="h1782665757648" onclick="tog(2026,5,14,'h1782665757648');openNoteModal('2026-06-14','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="15" data-note-hid="h1782665757648" onclick="tog(2026,5,15,'h1782665757648');openNoteModal('2026-06-15','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="16" data-note-hid="h1782665757648" onclick="tog(2026,5,16,'h1782665757648');openNoteModal('2026-06-16','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="17" data-note-hid="h1782665757648" onclick="tog(2026,5,17,'h1782665757648');openNoteModal('2026-06-17','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="18" data-note-hid="h1782665757648" onclick="tog(2026,5,18,'h1782665757648');openNoteModal('2026-06-18','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="19" data-note-hid="h1782665757648" onclick="tog(2026,5,19,'h1782665757648');openNoteModal('2026-06-19','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="20" data-note-hid="h1782665757648" onclick="tog(2026,5,20,'h1782665757648');openNoteModal('2026-06-20','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="21" data-note-hid="h1782665757648" onclick="tog(2026,5,21,'h1782665757648');openNoteModal('2026-06-21','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="22" data-note-hid="h1782665757648" onclick="tog(2026,5,22,'h1782665757648');openNoteModal('2026-06-22','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="23" data-note-hid="h1782665757648" onclick="tog(2026,5,23,'h1782665757648');openNoteModal('2026-06-23','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="24" data-note-hid="h1782665757648" onclick="tog(2026,5,24,'h1782665757648');openNoteModal('2026-06-24','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="25" data-note-hid="h1782665757648" onclick="tog(2026,5,25,'h1782665757648');openNoteModal('2026-06-25','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="26" data-note-hid="h1782665757648" onclick="tog(2026,5,26,'h1782665757648');openNoteModal('2026-06-26','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:1.5px solid #D89848;display:flex;align-items:center;justify-content:center;" data-note-day="27" data-note-hid="h1782665757648" onclick="tog(2026,5,27,'h1782665757648');openNoteModal('2026-06-27','h1782665757648')"></div><div class="dsq nsq" style="position:relative;border:2px solid #A05808;display:flex;align-items:center;justify-content:center;" data-note-day="28" data-note-hid="h1782665757648" onclick="tog(2026,5,28,'h1782665757648');openNoteModal('2026-06-28','h1782665757648')"><span style="font-size:8px;font-weight:700;line-height:1;color:#A05808;">28</span></div><div class="dsq" style="border:1.5px solid #D89848;opacity:.25;pointer-events:none;"></div><div class="dsq" style="border:1.5px solid #D89848;opacity:.25;pointer-events:none;"></div></div>
+      </div>
+      <hr class="card-divider">
+      <div class="year-section">
+        <p class="year-label">12 derniers mois</p>
+        <div style="position:relative;display:flex;align-items:flex-end;gap:3px;height:56px;width:100%;"><div class="sp-col" onclick="goMonth(2025,6)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#D89848;"></div>
+        <span class="sp-lbl" style="">J</span>
+      </div><div class="sp-col" onclick="goMonth(2025,7)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#D89848;"></div>
+        <span class="sp-lbl" style="">A</span>
+      </div><div class="sp-col" onclick="goMonth(2025,8)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#D89848;"></div>
+        <span class="sp-lbl" style="">S</span>
+      </div><div class="sp-col" onclick="goMonth(2025,9)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#D89848;"></div>
+        <span class="sp-lbl" style="">O</span>
+      </div><div class="sp-col" onclick="goMonth(2025,10)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#D89848;"></div>
+        <span class="sp-lbl" style="">N</span>
+      </div><div class="sp-col" onclick="goMonth(2025,11)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#D89848;"></div>
+        <span class="sp-lbl" style="">D</span>
+      </div><div class="sp-col" onclick="goMonth(2026,0)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#D89848;"></div>
+        <span class="sp-lbl" style="">J</span>
+      </div><div class="sp-col" onclick="goMonth(2026,1)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#D89848;"></div>
+        <span class="sp-lbl" style="">F</span>
+      </div><div class="sp-col" onclick="goMonth(2026,2)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#D89848;"></div>
+        <span class="sp-lbl" style="">M</span>
+      </div><div class="sp-col" onclick="goMonth(2026,3)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#D89848;"></div>
+        <span class="sp-lbl" style="">A</span>
+      </div><div class="sp-col" onclick="goMonth(2026,4)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#D89848;"></div>
+        <span class="sp-lbl" style="">M</span>
+      </div><div class="sp-col" onclick="goMonth(2026,5)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#A05808;box-shadow:0 0 0 1.5px #A0580844;"></div>
+        <span class="sp-cur" style="color:#A05808;">J</span>
+      </div><div style="position:absolute;bottom:13px;left:0;right:0;border-top:1.5px dashed #A0580888;pointer-events:none;"></div></div>
+          <div style="margin-top:7px;padding-top:6px;border-top:1px solid #D8984822;">
+      <div onclick="const el=document.getElementById('yc_h1782665757648');el.style.display=el.style.display==='flex'?'none':'flex'" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+        <span style="font-size:11px;color:#D89848;">2025 <strong style="color:#D89848;font-size:13px;">0</strong></span>
+        <span style="font-size:10px;color:#D8984844;">→</span>
+        <span style="font-size:11px;color:#D89848;"><strong style="color:#A05808;">2026</strong> <span style="color:#A05808;font-size:13px;">0</span></span>
+        <span style="font-size:9px;color:#D8984844;margin-left:auto;">▾</span>
+      </div>
+      <div id="yc_h1782665757648" style="display:none;margin-top:5px;flex-wrap:wrap;gap:6px;"></div>
     </div>
-    <p style="font-size:13px;color:#888;">Colle ton JSON Notion ici pour mettre à jour le tracker.</p>
-    <textarea id="imp-ta" placeholder='{"habits":[...],"completions":{...}}' style="height:200px;padding:10px;border:1.5px solid #E0E0E0;border-radius:10px;font-size:10px;font-family:monospace;resize:none;outline:none;color:#555;background:#F8F8F8;"></textarea>
-    <button onclick="
-      try{
-        const d=JSON.parse(document.getElementById('imp-ta').value);
-        if(!d.habits||!d.completions)throw new Error('Format invalide');
-        H=d.habits;C=d.completions;sv();
-        document.getElementById('imp-modal').remove();
-        rl();
-        const t=document.createElement('div');
-        t.style.cssText='position:fixed;bottom:100px;left:50%;transform:translateX(-50%);background:#34C759;color:#fff;padding:10px 20px;border-radius:20px;font-size:14px;font-weight:600;z-index:9999;';
-        t.textContent='✓ Données importées !';
-        document.body.appendChild(t);
-        setTimeout(()=>t.remove(),2500);
-      }catch(e){alert('JSON invalide : '+e.message);}
-    " style="padding:13px;border:none;border-radius:12px;background:#2B9FE0;color:#fff;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;">Importer</button>
-  </div>`;
-  document.body.appendChild(ov);
-  ov.addEventListener('click',e=>{if(e.target===ov)ov.remove();});
-}
-
-function doExport(){
-  const data={habits:H,completions:C,exportedAt:new Date().toISOString()};
-  const json=JSON.stringify(data,null,2);
-  try{
-    const blob=new Blob([json],{type:'application/json'});
-    const url=URL.createObjectURL(blob);
-    const a=document.createElement('a');
-    a.href=url;a.download='habits_backup_'+new Date().toISOString().slice(0,10)+'.json';
-    document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);
-  }catch(e){}
-  const ov=document.createElement('div');
-  ov.id='exp-modal';
-  ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:999;display:flex;align-items:center;justify-content:center;padding:20px;';
-  ov.innerHTML=`<div style="background:#fff;border-radius:16px;padding:20px;width:100%;max-width:440px;display:flex;flex-direction:column;gap:12px;">
-    <div style="display:flex;align-items:center;justify-content:space-between;">
-      <p style="font-size:15px;font-weight:600;color:#1C1C1E;">💾 Sauvegarde</p>
-      <button onclick="document.getElementById('exp-modal').remove()" style="background:none;border:none;cursor:pointer;font-size:22px;color:#999;">×</button>
+      </div>
+    </div><div class="hcard" data-id="h1778141203832" style="border-top:3px solid #1E8858;">
+      <div class="card-top">
+        <div class="drag-handle" title="Maintenir pour déplacer">⠿</div>
+        <div class="card-left">
+          <p class="hname" style="color:#1E8858;">Trail</p>
+          <div class="hcount-row">
+            <span class="hcount-num" style="color:#1E8858;">0</span>
+            <span class="hcount-lbl" style="color:#1E8858;">fois ce mois</span>
+          </div>
+          
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:3px;width:154px;flex-shrink:0;" onclick="event.stopPropagation()"><div style="text-align:center;font-size:8px;font-weight:600;color:#68C098;padding-bottom:2px;">L</div><div style="text-align:center;font-size:8px;font-weight:600;color:#68C098;padding-bottom:2px;">M</div><div style="text-align:center;font-size:8px;font-weight:600;color:#68C098;padding-bottom:2px;">M</div><div style="text-align:center;font-size:8px;font-weight:600;color:#68C098;padding-bottom:2px;">J</div><div style="text-align:center;font-size:8px;font-weight:600;color:#68C098;padding-bottom:2px;">V</div><div style="text-align:center;font-size:8px;font-weight:600;color:#68C098;padding-bottom:2px;">S</div><div style="text-align:center;font-size:8px;font-weight:600;color:#68C098;padding-bottom:2px;">D</div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,1,'h1778141203832')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,2,'h1778141203832')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,3,'h1778141203832')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,4,'h1778141203832')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,5,'h1778141203832')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,6,'h1778141203832')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,7,'h1778141203832')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,8,'h1778141203832')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,9,'h1778141203832')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,10,'h1778141203832')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,11,'h1778141203832')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,12,'h1778141203832')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,13,'h1778141203832')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,14,'h1778141203832')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,15,'h1778141203832')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,16,'h1778141203832')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,17,'h1778141203832')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,18,'h1778141203832')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,19,'h1778141203832')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,20,'h1778141203832')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,21,'h1778141203832')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,22,'h1778141203832')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,23,'h1778141203832')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,24,'h1778141203832')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,25,'h1778141203832')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,26,'h1778141203832')"></div><div class="dsq" style="position:relative;border:1.5px solid #68C098;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,27,'h1778141203832')"></div><div class="dsq" style="position:relative;border:2px solid #1E8858;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,28,'h1778141203832')"><span style="font-size:8px;font-weight:700;line-height:1;color:#1E8858;">28</span></div><div class="dsq" style="border:1.5px solid #68C098;opacity:.25;pointer-events:none;"></div><div class="dsq" style="border:1.5px solid #68C098;opacity:.25;pointer-events:none;"></div></div>
+      </div>
+      <hr class="card-divider">
+      <div class="year-section">
+        <p class="year-label">12 derniers mois</p>
+        <div style="position:relative;display:flex;align-items:flex-end;gap:3px;height:56px;width:100%;"><div class="sp-col" onclick="goMonth(2025,6)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#68C098;"></div>
+        <span class="sp-lbl" style="">J</span>
+      </div><div class="sp-col" onclick="goMonth(2025,7)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#68C098;"></div>
+        <span class="sp-lbl" style="">A</span>
+      </div><div class="sp-col" onclick="goMonth(2025,8)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#68C098;"></div>
+        <span class="sp-lbl" style="">S</span>
+      </div><div class="sp-col" onclick="goMonth(2025,9)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#68C098;"></div>
+        <span class="sp-lbl" style="">O</span>
+      </div><div class="sp-col" onclick="goMonth(2025,10)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#68C098;"></div>
+        <span class="sp-lbl" style="">N</span>
+      </div><div class="sp-col" onclick="goMonth(2025,11)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#68C098;"></div>
+        <span class="sp-lbl" style="">D</span>
+      </div><div class="sp-col" onclick="goMonth(2026,0)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#68C098;"></div>
+        <span class="sp-lbl" style="">J</span>
+      </div><div class="sp-col" onclick="goMonth(2026,1)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#68C098;"></div>
+        <span class="sp-lbl" style="">F</span>
+      </div><div class="sp-col" onclick="goMonth(2026,2)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#68C098;"></div>
+        <span class="sp-lbl" style="">M</span>
+      </div><div class="sp-col" onclick="goMonth(2026,3)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#68C098;"></div>
+        <span class="sp-lbl" style="">A</span>
+      </div><div class="sp-col" onclick="goMonth(2026,4)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#68C098;"></div>
+        <span class="sp-lbl" style="">M</span>
+      </div><div class="sp-col" onclick="goMonth(2026,5)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#1E8858;box-shadow:0 0 0 1.5px #1E885844;"></div>
+        <span class="sp-cur" style="color:#1E8858;">J</span>
+      </div><div style="position:absolute;bottom:13px;left:0;right:0;border-top:1.5px dashed #1E885888;pointer-events:none;"></div></div>
+          <div style="margin-top:7px;padding-top:6px;border-top:1px solid #68C09822;">
+      <div onclick="const el=document.getElementById('yc_h1778141203832');el.style.display=el.style.display==='flex'?'none':'flex'" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+        <span style="font-size:11px;color:#68C098;">2025 <strong style="color:#68C098;font-size:13px;">0</strong></span>
+        <span style="font-size:10px;color:#68C09844;">→</span>
+        <span style="font-size:11px;color:#68C098;"><strong style="color:#1E8858;">2026</strong> <span style="color:#1E8858;font-size:13px;">0</span></span>
+        <span style="font-size:9px;color:#68C09844;margin-left:auto;">▾</span>
+      </div>
+      <div id="yc_h1778141203832" style="display:none;margin-top:5px;flex-wrap:wrap;gap:6px;"></div>
     </div>
-    <p style="font-size:13px;color:#888;">Copie et envoie ce texte à Claude pour restaurer.</p>
-    <textarea id="exp-ta" readonly style="height:180px;padding:10px;border:1px solid #E0E0E0;border-radius:10px;font-size:10px;font-family:monospace;resize:none;outline:none;color:#555;background:#F8F8F8;">${json}</textarea>
-    <button onclick="navigator.clipboard.writeText(document.getElementById('exp-ta').value).then(()=>{this.textContent='✓ Copié !';this.style.background='#34C759';}).catch(()=>{document.getElementById('exp-ta').select();document.execCommand('copy');this.textContent='✓ Copié !';this.style.background='#34C759';})" style="padding:13px;border:none;border-radius:12px;background:#2B9FE0;color:#fff;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;">📋 Copier le JSON</button>
-  </div>`;
-  document.body.appendChild(ov);
-  ov.addEventListener('click',e=>{if(e.target===ov)ov.remove();});
-}
-
-function doEdit(){
-  if(!H.length)return;
-  const idx=prompt(H.map((h,i)=>`${i+1}. ${h.name}`).join('\n')+'\n\nNuméro à supprimer :');
-  const n=parseInt(idx);
-  if(n>=1&&n<=H.length&&confirm(`Supprimer "${H[n-1].name}" ?`)){H.splice(n-1,1);sv();rl();}
-}
-function prevM(){if(cM===0){cM=11;cY--;}else cM--;rl();}
-function nextM(){const nM=tM===11?0:tM+1,nY=tM===11?tY+1:tY;if(cY===nY&&cM===nM)return;if(cM===11){cM=0;cY++;}else cM++;rl();}
-
-document.getElementById('new-name').addEventListener('keydown',e=>{if(e.key==='Enter')commitAdd();if(e.key==='Escape')closeAdd();});
-load();cY=tY;cM=tM;rl();
-</script>
-</body>
-</html>
+      </div>
+    </div><div class="hcard" data-id="h1778141226482" style="border-top:3px solid #6048B8;">
+      <div class="card-top">
+        <div class="drag-handle" title="Maintenir pour déplacer">⠿</div>
+        <div class="card-left">
+          <p class="hname" style="color:#6048B8;">Anglais</p>
+          <div class="hcount-row">
+            <span class="hcount-num" style="color:#6048B8;">0</span>
+            <span class="hcount-lbl" style="color:#6048B8;">fois ce mois</span>
+          </div>
+          
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:3px;width:154px;flex-shrink:0;" onclick="event.stopPropagation()"><div style="text-align:center;font-size:8px;font-weight:600;color:#A888D8;padding-bottom:2px;">L</div><div style="text-align:center;font-size:8px;font-weight:600;color:#A888D8;padding-bottom:2px;">M</div><div style="text-align:center;font-size:8px;font-weight:600;color:#A888D8;padding-bottom:2px;">M</div><div style="text-align:center;font-size:8px;font-weight:600;color:#A888D8;padding-bottom:2px;">J</div><div style="text-align:center;font-size:8px;font-weight:600;color:#A888D8;padding-bottom:2px;">V</div><div style="text-align:center;font-size:8px;font-weight:600;color:#A888D8;padding-bottom:2px;">S</div><div style="text-align:center;font-size:8px;font-weight:600;color:#A888D8;padding-bottom:2px;">D</div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,1,'h1778141226482')"></div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,2,'h1778141226482')"></div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,3,'h1778141226482')"></div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,4,'h1778141226482')"></div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,5,'h1778141226482')"></div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,6,'h1778141226482')"></div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,7,'h1778141226482')"></div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,8,'h1778141226482')"></div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,9,'h1778141226482')"></div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,10,'h1778141226482')"></div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,11,'h1778141226482')"></div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,12,'h1778141226482')"></div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,13,'h1778141226482')"></div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,14,'h1778141226482')"></div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,15,'h1778141226482')"></div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,16,'h1778141226482')"></div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,17,'h1778141226482')"></div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,18,'h1778141226482')"></div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,19,'h1778141226482')"></div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,20,'h1778141226482')"></div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,21,'h1778141226482')"></div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,22,'h1778141226482')"></div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,23,'h1778141226482')"></div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,24,'h1778141226482')"></div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,25,'h1778141226482')"></div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,26,'h1778141226482')"></div><div class="dsq" style="position:relative;border:1.5px solid #A888D8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,27,'h1778141226482')"></div><div class="dsq" style="position:relative;border:2px solid #6048B8;display:flex;align-items:center;justify-content:center;" onclick="tog(2026,5,28,'h1778141226482')"><span style="font-size:8px;font-weight:700;line-height:1;color:#6048B8;">28</span></div><div class="dsq" style="border:1.5px solid #A888D8;opacity:.25;pointer-events:none;"></div><div class="dsq" style="border:1.5px solid #A888D8;opacity:.25;pointer-events:none;"></div></div>
+      </div>
+      <hr class="card-divider">
+      <div class="year-section">
+        <p class="year-label">12 derniers mois</p>
+        <div style="position:relative;display:flex;align-items:flex-end;gap:3px;height:56px;width:100%;"><div class="sp-col" onclick="goMonth(2025,6)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#A888D8;"></div>
+        <span class="sp-lbl" style="">J</span>
+      </div><div class="sp-col" onclick="goMonth(2025,7)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#A888D8;"></div>
+        <span class="sp-lbl" style="">A</span>
+      </div><div class="sp-col" onclick="goMonth(2025,8)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#A888D8;"></div>
+        <span class="sp-lbl" style="">S</span>
+      </div><div class="sp-col" onclick="goMonth(2025,9)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#A888D8;"></div>
+        <span class="sp-lbl" style="">O</span>
+      </div><div class="sp-col" onclick="goMonth(2025,10)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#A888D8;"></div>
+        <span class="sp-lbl" style="">N</span>
+      </div><div class="sp-col" onclick="goMonth(2025,11)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#A888D8;"></div>
+        <span class="sp-lbl" style="">D</span>
+      </div><div class="sp-col" onclick="goMonth(2026,0)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#A888D8;"></div>
+        <span class="sp-lbl" style="">J</span>
+      </div><div class="sp-col" onclick="goMonth(2026,1)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#A888D8;"></div>
+        <span class="sp-lbl" style="">F</span>
+      </div><div class="sp-col" onclick="goMonth(2026,2)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#A888D8;"></div>
+        <span class="sp-lbl" style="">M</span>
+      </div><div class="sp-col" onclick="goMonth(2026,3)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#A888D8;"></div>
+        <span class="sp-lbl" style="">A</span>
+      </div><div class="sp-col" onclick="goMonth(2026,4)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#A888D8;"></div>
+        <span class="sp-lbl" style="">M</span>
+      </div><div class="sp-col" onclick="goMonth(2026,5)">
+        <span style="font-size:8px;font-weight:700;color:transparent;height:10px;line-height:10px;"></span>
+        <div class="sp-bar" style="height:0px;background:#6048B8;box-shadow:0 0 0 1.5px #6048B844;"></div>
+        <span class="sp-cur" style="color:#6048B8;">J</span>
+      </div><div style="position:absolute;bottom:13px;left:0;right:0;border-top:1.5px dashed #6048B888;pointer-events:none;"></div></div>
+          <div style="margin-top:7px;padding-top:6px;border-top:1px solid #A888D822;">
+      <div onclick="const el=document.getElementById('yc_h1778141226482');el.style.display=el.style.display==='flex'?'none':'flex'" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+        <span style="font-size:11px;color:#A888D8;">2025 <strong style="color:#A888D8;font-size:13px;">0</strong></span>
+        <span style="font-size:10px;color:#A888D844;">→</span>
+        <span style="font-size:11px;color:#A888D8;"><strong style="color:#6048B8;">2026</strong> <span style="color:#6048B8;font-size:13px;">0</span></span>
+        <span style="f
